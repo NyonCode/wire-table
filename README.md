@@ -1,0 +1,2 @@
+# wire-table
+READ ONLY
