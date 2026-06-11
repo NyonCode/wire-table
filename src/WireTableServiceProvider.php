@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace NyonCode\WireTable;
 
+use Livewire\Mechanisms\HandleComponents\HandleComponents;
 use NyonCode\LaravelPackageToolkit\Packager;
 use NyonCode\LaravelPackageToolkit\PackageServiceProvider;
+use NyonCode\WireTable\Livewire\TableStateSynthesizer;
 
 class WireTableServiceProvider extends PackageServiceProvider
 {
@@ -19,6 +21,10 @@ class WireTableServiceProvider extends PackageServiceProvider
         $packager
             ->name('WireTable')
             ->hasShortName('wire-table')
+            ->bootedPackage(function ($packager) {
+                app(HandleComponents::class)
+                    ->registerPropertySynthesizer(TableStateSynthesizer::class);
+            })
             ->hasConfig()
             ->hasViews()
             ->hasTranslations()

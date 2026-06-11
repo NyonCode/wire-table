@@ -5,27 +5,35 @@ declare(strict_types=1);
 namespace NyonCode\WireTable\Columns;
 
 use Closure;
-use Illuminate\Contracts\Auth\Authenticatable;
 use Illuminate\Contracts\Support\Htmlable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Pivot;
+use Illuminate\Support\Facades\Gate;
 use Illuminate\Support\Str;
 use NyonCode\WireCore\Core\Capabilities\Capability;
 use NyonCode\WireCore\Core\Components\DataComponent;
 use NyonCode\WireCore\Core\Support\Trans;
+use NyonCode\WireCore\Foundation\Colors\Color;
+use NyonCode\WireCore\Foundation\Concerns\HasAuthorization;
+use NyonCode\WireCore\Foundation\Concerns\HasColor;
+use NyonCode\WireCore\Foundation\Concerns\HasIcon;
+use NyonCode\WireCore\Foundation\Concerns\HasSize;
+use NyonCode\WireCore\Foundation\Icons\IconManager;
 use NyonCode\WireTable\Concerns\HasSummary;
-use Throwable;
+use NyonCode\WireTable\Concerns\HasView;
 
 /** @phpstan-consistent-constructor */
 class Column extends DataComponent implements Htmlable
 {
+    use HasAuthorization;
+    use HasColor;
+    use HasIcon;
+    use HasSize;
     use HasSummary;
+    use HasView;
 
-    /** @var bool Whether the column can be sorted */
-    protected bool $sortable = false;
-
-    /** @var bool Whether the column is included in search */
-    protected bool $searchable = false;
+    // Note: $sortable and $searchable booleans removed in v2.
+    // Use capabilities as single source of truth via isSortable()/isSearchable().
 
     /** @var array<int, string> Explicit DB columns to search (Filament-style: searchable(['first_name', 'last_name'])) */
     protected array $searchColumns = [];
@@ -111,11 +119,9 @@ class Column extends DataComponent implements Htmlable
     /** @var string|null Text/icon color (e.g., 'primary', 'danger', '#FF0000') */
     protected ?string $color = null;
 
-    /** @var string|null Icon class or name */
-    protected ?string $icon = null;
-
-    /** @var string|null Icon position relative to text ('before' or 'after') */
-    protected ?string $iconPosition = null;
+    // $icon and $iconPosition are provided by Foundation\Concerns\HasIcon
+    // (string|Closure|null), giving columns the same closure-aware icon API as
+    // forms fields and core actions.
 
     /** @var bool Whether the cell content contains raw HTML */
     protected bool $html = false;
@@ -123,15 +129,24 @@ class Column extends DataComponent implements Htmlable
     /** @var Closure|null Callback to determine if the column should be visible */
     protected ?Closure $visibleCallback = null;
 
-    /** @var string|null Required permission to view this column */
-    protected ?string $permission = null;
+    /** @var string|null Gate ability for inline editing */
+    protected ?string $inlineEditAbility = null;
 
     /** @var bool Whether this column is for a pivot table */
     protected bool $isPivot = false;
 
+    // ── Aggregate support ─────────────────────────────────────────
+    /** @var string|null Aggregate function: 'count', 'sum', 'avg', 'min', 'max' */
+    protected ?string $aggregateFunction = null;
+
+    /** @var string|null Relation name for aggregate (e.g., 'orders') */
+    protected ?string $aggregateRelation = null;
+
+    /** @var string|null Column to aggregate on (e.g., 'total' for sum) */
+    protected ?string $aggregateColumn = null;
+
     // Inline editing properties
-    /** @var bool Whether the column is editable */
-    protected bool $editable = false;
+    // Note: $editable boolean removed in v2. Use capabilities.
 
     /** @var string|null Type of input for inline editing (e.g., 'text', 'select', 'date') */
     protected ?string $editableType = 'text';
@@ -146,8 +161,7 @@ class Column extends DataComponent implements Htmlable
     protected ?Closure $editableCallback = null;
 
     // Column filtering properties
-    /** @var bool Whether the column can be filtered */
-    protected bool $filterable = false;
+    // Note: $filterable boolean removed in v2. Use capabilities.
 
     /**
      * Type of filter input.
@@ -251,6 +265,110 @@ class Column extends DataComponent implements Htmlable
         return $this->isPivot;
     }
 
+    // ── Aggregate methods ─────────────────────────────────────────
+
+    /**
+     * Count related records.
+     *
+     * Usage: Column::make('orders_count')->counts('orders')
+     */
+    public function counts(string $relationship): static
+    {
+        $this->aggregateFunction = 'count';
+        $this->aggregateRelation = $relationship;
+
+        return $this;
+    }
+
+    /**
+     * Sum a column on related records.
+     *
+     * Usage: Column::make('orders_total')->sums('orders', 'total')
+     */
+    public function sums(string $relationship, string $column): static
+    {
+        $this->aggregateFunction = 'sum';
+        $this->aggregateRelation = $relationship;
+        $this->aggregateColumn = $column;
+
+        return $this;
+    }
+
+    /**
+     * Average a column on related records.
+     *
+     * Usage: Column::make('avg_rating')->averages('reviews', 'rating')
+     */
+    public function averages(string $relationship, string $column): static
+    {
+        $this->aggregateFunction = 'avg';
+        $this->aggregateRelation = $relationship;
+        $this->aggregateColumn = $column;
+
+        return $this;
+    }
+
+    /**
+     * Min of a column on related records.
+     */
+    public function mins(string $relationship, string $column): static
+    {
+        $this->aggregateFunction = 'min';
+        $this->aggregateRelation = $relationship;
+        $this->aggregateColumn = $column;
+
+        return $this;
+    }
+
+    /**
+     * Max of a column on related records.
+     */
+    public function maxes(string $relationship, string $column): static
+    {
+        $this->aggregateFunction = 'max';
+        $this->aggregateRelation = $relationship;
+        $this->aggregateColumn = $column;
+
+        return $this;
+    }
+
+    public function isAggregate(): bool
+    {
+        return $this->aggregateFunction !== null;
+    }
+
+    public function getAggregateFunction(): ?string
+    {
+        return $this->aggregateFunction;
+    }
+
+    public function getAggregateRelation(): ?string
+    {
+        return $this->aggregateRelation;
+    }
+
+    public function getAggregateColumn(): ?string
+    {
+        return $this->aggregateColumn;
+    }
+
+    /**
+     * Get the attribute name that Eloquent uses for withCount/withSum.
+     * E.g., withCount('orders') → 'orders_count', withSum('orders', 'total') → 'orders_sum_total'
+     */
+    public function getAggregateAttribute(): ?string
+    {
+        if ($this->aggregateFunction === null || $this->aggregateRelation === null) {
+            return null;
+        }
+
+        if ($this->aggregateFunction === 'count') {
+            return "{$this->aggregateRelation}_count";
+        }
+
+        return "{$this->aggregateRelation}_{$this->aggregateFunction}_{$this->aggregateColumn}";
+    }
+
     /**
      * Set the label of the column.
      */
@@ -273,7 +391,7 @@ class Column extends DataComponent implements Htmlable
 
     public function isSortable(): bool
     {
-        return $this->sortable;
+        return $this->hasCapability(Capability::Sortable);
     }
 
     /**
@@ -289,20 +407,17 @@ class Column extends DataComponent implements Htmlable
     public function searchable(bool|array $searchable = true, ?Closure $query = null): static
     {
         if (is_array($searchable)) {
-            $this->searchable = true;
             $this->searchColumns = $searchable;
+            $this->capabilities = $this->capabilities->add(Capability::Searchable);
         } else {
-            $this->searchable = $searchable;
+            $this->capabilities = $searchable
+                ? $this->capabilities->add(Capability::Searchable)
+                : $this->capabilities->remove(Capability::Searchable);
         }
 
         if ($query !== null) {
             $this->searchCallback = $query;
         }
-
-        // Bridge to capability system
-        $this->capabilities = $this->searchable
-            ? $this->capabilities->add(Capability::Searchable)
-            : $this->capabilities->remove(Capability::Searchable);
 
         return $this;
     }
@@ -312,7 +427,7 @@ class Column extends DataComponent implements Htmlable
      */
     public function isSearchable(): bool
     {
-        return $this->searchable;
+        return $this->hasCapability(Capability::Searchable);
     }
 
     /**
@@ -332,7 +447,7 @@ class Column extends DataComponent implements Htmlable
      */
     public function searchUsing(Closure $callback): static
     {
-        $this->searchable = true;
+        $this->capabilities = $this->capabilities->add(Capability::Searchable);
         $this->searchCallback = $callback;
 
         return $this;
@@ -355,16 +470,13 @@ class Column extends DataComponent implements Htmlable
      */
     public function sortable(bool $sortable = true, ?Closure $query = null): static
     {
-        $this->sortable = $sortable;
+        $this->capabilities = $sortable
+            ? $this->capabilities->add(Capability::Sortable)
+            : $this->capabilities->remove(Capability::Sortable);
 
         if ($query !== null) {
             $this->sortCallback = $query;
         }
-
-        // Bridge to capability system
-        $this->capabilities = $this->sortable
-            ? $this->capabilities->add(Capability::Sortable)
-            : $this->capabilities->remove(Capability::Sortable);
 
         return $this;
     }
@@ -376,7 +488,7 @@ class Column extends DataComponent implements Htmlable
      */
     public function sortUsing(Closure $callback): static
     {
-        $this->sortable = true;
+        $this->capabilities = $this->capabilities->add(Capability::Sortable);
         $this->sortCallback = $callback;
 
         return $this;
@@ -592,13 +704,11 @@ class Column extends DataComponent implements Htmlable
             return $mobileContent;
         }
 
-        return sprintf(
-            '<span class="%s:hidden">%s</span><span class="hidden %s:inline">%s</span>',
-            $bp,
-            $mobileContent,
-            $bp,
-            $desktopContent,
-        );
+        return trim($this->renderView('tables.columns.responsive', [
+            'breakpoint' => $bp,
+            'mobileContent' => $mobileContent,
+            'desktopContent' => $desktopContent,
+        ]));
     }
 
     /**
@@ -617,140 +727,35 @@ class Column extends DataComponent implements Htmlable
 
         $state = $this->getState($record);
 
-        if ($this->displayUsing) {
-            $content = (string) call_user_func($this->displayUsing, $state, $record);
-        } else {
-            $content = $this->formatValue($state, $record);
-        }
+        $content = $this->displayUsing
+            ? (string) ($this->displayUsing)($state, $record)
+            : $this->formatValue($state, $record);
 
-        // Apply text styling
-        $classes = $this->getTextClasses();
-        if ($classes && ! $this->html) {
-            $content = '<span class="'.$classes.'">'.e($content).'</span>';
-        } elseif ($classes) {
-            $content = '<span class="'.$classes.'">'.$content.'</span>';
-        } elseif (! $this->html) {
-            $content = e($content);
-        }
+        $description = $this->description !== null
+            ? (is_callable($this->description) ? ($this->description)($record) : $this->description)
+            : null;
 
-        // Add icon if set
-        if ($this->icon) {
-            $iconHtml = $this->renderIcon($this->icon);
-            if ($this->iconPosition === 'after') {
-                $content = $content.' '.$iconHtml;
-            } else {
-                $content = $iconHtml.' '.$content;
-            }
-        }
-
-        // Wrap in URL if set
-        $url = $this->getUrl($record);
-        if ($url) {
-            $target = $this->openUrlInNewTab ? ' target="_blank"' : '';
-            $content =
-                '<a href="'.
-                e($url).
-                '"'.
-                $target.
-                ' class="text-primary-600 hover:text-primary-800 dark:text-primary-400 dark:hover:text-primary-300 hover:underline">'.
-                $content.
-                '</a>';
-        }
-
-        // Add copyable button if enabled
-        if ($this->copyable) {
-            $copyValue = e(str_replace("'", "\\'", (string) $state));
-            $copyMessage = e($this->copyMessage ?? Trans::get('wire-table::messages.copied'));
-            $copyTitle = e(Trans::get('wire-table::messages.copy'));
-            $content = <<<HTML
-            <span class="inline-flex items-center gap-1.5 group" x-data="{ copied: false }">
-                {$content}
-                <button
-                    type="button"
-                    x-on:click="
-                        navigator.clipboard.writeText('$copyValue');
-                        copied = true;
-                        setTimeout(() => copied = false, 2000);
-                    "
-                    class="opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
-                    title="$copyTitle"
-                >
-                    <template x-if="!copied">
-                        <svg class="w-4 h-4 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
-                        </svg>
-                    </template>
-                    <template x-if="copied">
-                        <svg class="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
-                        </svg>
-                    </template>
-                </button>
-                <span
-                    x-show="copied"
-                    x-transition:enter="transition ease-out duration-200"
-                    x-transition:enter-start="opacity-0 translate-x-1"
-                    x-transition:enter-end="opacity-100 translate-x-0"
-                    x-transition:leave="transition ease-in duration-150"
-                    x-transition:leave-start="opacity-100"
-                    x-transition:leave-end="opacity-0"
-                    class="text-xs text-emerald-600 dark:text-emerald-400 font-medium"
-                >$copyMessage</span>
-            </span>
-            HTML;
-        }
-
-        // Add tooltip if set
-        if ($this->tooltip) {
-            $tooltipText = e($this->tooltip);
-            $content = '<span title="'.$tooltipText.'" class="cursor-help">'.$content.'</span>';
-        }
-
-        // Add description if set
-        if ($this->description) {
-            $descriptionText = is_callable($this->description)
-                ? call_user_func($this->description, $record)
-                : $this->description;
-
-            if ($descriptionText) {
-                $descriptionHtml =
-                    '<p class="text-sm text-gray-500 dark:text-gray-400">'.e($descriptionText).'</p>';
-
-                if ($this->descriptionPosition === 'above') {
-                    $content = $descriptionHtml.$content;
-                } else {
-                    $content = $content.$descriptionHtml;
-                }
-
-                $content = '<div>'.$content.'</div>';
-            }
-        }
-
-        return $content;
+        // Column owns state/config; the text partial owns all cell markup.
+        return trim($this->renderView('tables.columns.text', [
+            'content' => $content,
+            'textClasses' => $this->getTextClasses(),
+            'isHtml' => $this->html,
+            'iconHtml' => $this->icon ? $this->renderIcon($this->icon) : '',
+            'iconPosition' => $this->iconPosition ?? 'before',
+            'url' => $this->getUrl($record),
+            'openInNewTab' => $this->openUrlInNewTab,
+            'copyable' => $this->copyable,
+            'copyValue' => $state,
+            'copyMessage' => $this->copyMessage ?? Trans::get('wire-table::messages.copied'),
+            'tooltip' => $this->tooltip,
+            'description' => $description,
+            'descriptionPosition' => $this->descriptionPosition,
+        ]));
     }
 
     public function canView(): bool
     {
-        if (! $this->permission) {
-            return true;
-        }
-
-        /** @var Authenticatable|null $user */
-        $user = auth()->guard()->user();
-        if (! $user) {
-            return false;
-        }
-
-        if (method_exists($user, 'hasRole') && $user->hasRole('Super Admin')) {
-            return true;
-        }
-
-        // Spatie Permission support
-        if (method_exists($user, 'hasPermissionTo')) {
-            return $user->hasPermissionTo($this->permission);
-        }
-
-        return true;
+        return $this->isAuthorized();
     }
 
     /**
@@ -769,11 +774,23 @@ class Column extends DataComponent implements Htmlable
             return ($this->stateCallback)($record);
         }
 
+        // Aggregate columns: read from withCount/withSum attribute
+        if ($this->isAggregate()) {
+            $attr = $this->getAggregateAttribute();
+            $value = $attr !== null ? $record->getAttribute($attr) : null;
+
+            if ($this->formatStateUsing) {
+                $value = ($this->formatStateUsing)($value, $record);
+            }
+
+            return $value ?? $this->default;
+        }
+
         // fallback: resolveValue + formatStateUsing
         $value = $this->resolveValue($record);
 
         if ($this->formatStateUsing) {
-            $value = call_user_func($this->formatStateUsing, $value, $record);
+            $value = ($this->formatStateUsing)($value, $record);
         }
 
         if ($value === null || $value === '') {
@@ -873,16 +890,12 @@ class Column extends DataComponent implements Htmlable
         }
 
         if ($this->textColor) {
-            $classes[] = match ($this->textColor) {
-                'primary' => 'text-primary-600 dark:text-primary-400',
-                'secondary' => 'text-gray-500 dark:text-gray-400',
-                'success' => 'text-emerald-600 dark:text-emerald-400',
-                'danger' => 'text-red-600 dark:text-red-400',
-                'warning' => 'text-amber-600 dark:text-amber-400',
-                'info' => 'text-sky-600 dark:text-sky-400',
-                'muted' => 'text-gray-400 dark:text-gray-500',
-                default => $this->textColor,
-            };
+            // 'muted' is a text treatment (lighter gray), not a palette color, so
+            // it keeps its dedicated shade; every real color goes through the
+            // canonical Foundation palette so hues stay consistent everywhere.
+            $classes[] = $this->textColor === 'muted'
+                ? 'text-gray-400 dark:text-gray-500'
+                : self::getTextColorClasses($this->textColor);
         }
 
         return implode(' ', $classes);
@@ -894,72 +907,25 @@ class Column extends DataComponent implements Htmlable
     protected function renderIcon(string $icon): string
     {
         $color = $this->color ? $this->getColorClass($this->color) : 'text-gray-400';
-        $path = $this->getIconPath($icon);
 
-        return '<svg class="w-4 h-4 inline-block '.
-            $color.
-            '" fill="currentColor" viewBox="0 0 20 20">'.
-            $path.
-            '</svg>';
+        return app(IconManager::class)->render($icon, 'w-4 h-4 inline-block', $color);
     }
 
     /**
-     * Get CSS class for a color
+     * Get the text color class for a palette color.
+     *
+     * Delegates to the canonical Foundation palette ({@see HasColor::getTextColorClasses()})
+     * so columns, badges and the rest of the framework share one set of hues.
      */
     protected function getColorClass(string $color): string
     {
-        return match ($color) {
-            'primary', 'blue' => 'text-primary-600 dark:text-primary-400',
-            'success', 'green' => 'text-emerald-600 dark:text-emerald-400',
-            'danger', 'red' => 'text-red-600 dark:text-red-400',
-            'warning', 'yellow' => 'text-amber-600 dark:text-amber-400',
-            'info', 'cyan' => 'text-cyan-600 dark:text-cyan-400',
-            'gray', 'secondary' => 'text-gray-500 dark:text-gray-400',
-            default => $color,
-        };
-    }
-
-    /**
-     * Get icon SVG path
-     */
-    protected function getIconPath(string $icon): string
-    {
-        return match ($icon) {
-            'pencil',
-            'edit' => '<path d="M13.586 3.586a2 2 0 112.828 2.828l-.793.793-2.828-2.828.793-.793zM11.379 5.793L3 14.172V17h2.828l8.38-8.379-2.83-2.828z"/>',
-            'trash',
-            'delete' => '<path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd"/>',
-            'eye',
-            'view' => '<path d="M10 12a2 2 0 100-4 2 2 0 000 4z"/><path fill-rule="evenodd" d="M.458 10C1.732 5.943 5.522 3 10 3s8.268 2.943 9.542 7c-1.274 4.057-5.064 7-9.542 7S1.732 14.057.458 10zM14 10a4 4 0 11-8 0 4 4 0 018 0z" clip-rule="evenodd"/>',
-            'check' => '<path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd"/>',
-            'x',
-            'close' => '<path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd"/>',
-            'check-circle' => '<path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/>',
-            'x-circle' => '<path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"/>',
-            'exclamation-circle' => '<path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/>',
-            'information-circle' => '<path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd"/>',
-            'mail',
-            'email' => '<path d="M2.003 5.884L10 9.882l7.997-3.998A2 2 0 0016 4H4a2 2 0 00-1.997 1.884z"/><path d="M18 8.118l-8 4-8-4V14a2 2 0 002 2h12a2 2 0 002-2V8.118z"/>',
-            'phone' => '<path d="M2 3a1 1 0 011-1h2.153a1 1 0 01.986.836l.74 4.435a1 1 0 01-.54 1.06l-1.548.773a11.037 11.037 0 006.105 6.105l.774-1.548a1 1 0 011.059-.54l4.435.74a1 1 0 01.836.986V17a1 1 0 01-1 1h-2C7.82 18 2 12.18 2 5V3z"/>',
-            'link' => '<path fill-rule="evenodd" d="M12.586 4.586a2 2 0 112.828 2.828l-3 3a2 2 0 01-2.828 0 1 1 0 00-1.414 1.414 4 4 0 005.656 0l3-3a4 4 0 00-5.656-5.656l-1.5 1.5a1 1 0 101.414 1.414l1.5-1.5zm-5 5a2 2 0 012.828 0 1 1 0 101.414-1.414 4 4 0 00-5.656 0l-3 3a4 4 0 105.656 5.656l1.5-1.5a1 1 0 10-1.414-1.414l-1.5 1.5a2 2 0 11-2.828-2.828l3-3z" clip-rule="evenodd"/>',
-            'external-link' => '<path d="M11 3a1 1 0 100 2h2.586l-6.293 6.293a1 1 0 101.414 1.414L15 6.414V9a1 1 0 102 0V4a1 1 0 00-1-1h-5z"/><path d="M5 5a2 2 0 00-2 2v8a2 2 0 002 2h8a2 2 0 002-2v-3a1 1 0 10-2 0v3H5V7h3a1 1 0 000-2H5z"/>',
-            'clipboard',
-            'copy' => '<path d="M8 3a1 1 0 011-1h2a1 1 0 110 2H9a1 1 0 01-1-1z"/><path d="M6 3a2 2 0 00-2 2v11a2 2 0 002 2h8a2 2 0 002-2V5a2 2 0 00-2-2 3 3 0 01-3 3H9a3 3 0 01-3-3z"/>',
-            'star' => '<path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z"/>',
-            'user' => '<path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd"/>',
-            'calendar' => '<path fill-rule="evenodd" d="M6 2a1 1 0 00-1 1v1H4a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-1V3a1 1 0 10-2 0v1H7V3a1 1 0 00-1-1zm0 5a1 1 0 000 2h8a1 1 0 100-2H6z" clip-rule="evenodd"/>',
-            'clock' => '<path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z" clip-rule="evenodd"/>',
-            'document' => '<path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" clip-rule="evenodd"/>',
-            'download' => '<path fill-rule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zm3.293-7.707a1 1 0 011.414 0L9 10.586V3a1 1 0 112 0v7.586l1.293-1.293a1 1 0 111.414 1.414l-3 3a1 1 0 01-1.414 0l-3-3a1 1 0 010-1.414z" clip-rule="evenodd"/>',
-            'upload' => '<path fill-rule="evenodd" d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM6.293 6.707a1 1 0 010-1.414l3-3a1 1 0 011.414 0l3 3a1 1 0 01-1.414 1.414L11 5.414V13a1 1 0 11-2 0V5.414L7.707 6.707a1 1 0 01-1.414 0z" clip-rule="evenodd"/>',
-            default => '<path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-8-3a1 1 0 00-.867.5 1 1 0 11-1.731-1A3 3 0 0113 8a3.001 3.001 0 01-2 2.83V11a1 1 0 11-2 0v-1a1 1 0 011-1 1 1 0 100-2zm0 8a1 1 0 100-2 1 1 0 000 2z" clip-rule="evenodd"/>',
-        };
+        return self::getTextColorClasses($color);
     }
 
     public function getUrl(Model $record): ?string
     {
         if ($this->urlCallback) {
-            return call_user_func($this->urlCallback, $record);
+            return ($this->urlCallback)($record);
         }
 
         return null;
@@ -972,7 +938,7 @@ class Column extends DataComponent implements Htmlable
     {
         if ($this->mobileDisplayUsing) {
             $state = $this->getState($record);
-            $content = call_user_func($this->mobileDisplayUsing, $state, $record, $this);
+            $content = ($this->mobileDisplayUsing)($state, $record, $this);
 
             return $this->html ? (string) $content : e((string) $content);
         }
@@ -987,7 +953,7 @@ class Column extends DataComponent implements Htmlable
     {
         if ($this->desktopDisplayUsing) {
             $state = $this->getState($record);
-            $content = call_user_func($this->desktopDisplayUsing, $state, $record, $this);
+            $content = ($this->desktopDisplayUsing)($state, $record, $this);
 
             return $this->html ? (string) $content : e((string) $content);
         }
@@ -1227,9 +1193,9 @@ class Column extends DataComponent implements Htmlable
         return $this->openUrlInNewTab;
     }
 
-    public function color(?string $color): static
+    public function color(string|Color|null $color): static
     {
-        $this->color = $color;
+        $this->color = $color instanceof Color ? $color->value : $color;
 
         return $this;
     }
@@ -1239,23 +1205,7 @@ class Column extends DataComponent implements Htmlable
         return $this->color;
     }
 
-    public function icon(?string $icon, ?string $position = 'before'): static
-    {
-        $this->icon = $icon;
-        $this->iconPosition = $position;
-
-        return $this;
-    }
-
-    public function getIcon(): ?string
-    {
-        return $this->icon;
-    }
-
-    public function getIconPosition(): ?string
-    {
-        return $this->iconPosition;
-    }
+    // icon(), getIcon() and getIconPosition() come from Foundation\Concerns\HasIcon.
 
     public function html(bool $html = true): static
     {
@@ -1281,22 +1231,37 @@ class Column extends DataComponent implements Htmlable
     public function isVisible(): bool
     {
         if ($this->visibleCallback) {
-            return call_user_func($this->visibleCallback);
+            return ($this->visibleCallback)();
         }
 
         return ! $this->hidden;
     }
 
-    public function permission(?string $permission): static
+    /**
+     * Set a Gate ability required for inline editing of this column.
+     */
+    public function authorizeInline(?string $ability): static
     {
-        $this->permission = $permission;
+        $this->inlineEditAbility = $ability;
 
         return $this;
     }
 
-    public function getPermission(): ?string
+    public function getInlineEditAbility(): ?string
     {
-        return $this->permission;
+        return $this->inlineEditAbility;
+    }
+
+    /**
+     * Check if the current user can inline-edit this column.
+     */
+    public function canInlineEdit(): bool
+    {
+        if (! $this->inlineEditAbility) {
+            return true;
+        }
+
+        return Gate::allows($this->inlineEditAbility);
     }
 
     /**
@@ -1304,21 +1269,19 @@ class Column extends DataComponent implements Htmlable
      */
     public function editable(bool $editable = true, string $type = 'text', array $options = []): static
     {
-        $this->editable = $editable;
-        $this->editableType = $type;
-        $this->editableOptions = $options;
-
-        // Bridge to capability system
-        $this->capabilities = $this->editable
+        $this->capabilities = $editable
             ? $this->capabilities->add(Capability::Editable)
             : $this->capabilities->remove(Capability::Editable);
+
+        $this->editableType = $type;
+        $this->editableOptions = $options;
 
         return $this;
     }
 
     public function isEditable(): bool
     {
-        return $this->editable;
+        return $this->hasCapability(Capability::Editable);
     }
 
     public function getEditableType(): string
@@ -1349,7 +1312,7 @@ class Column extends DataComponent implements Htmlable
     public function getEditableRules(?Model $record): array
     {
         if ($this->editableRules) {
-            return call_user_func($this->editableRules, $record);
+            return ($this->editableRules)($record);
         }
 
         return [];
@@ -1367,7 +1330,11 @@ class Column extends DataComponent implements Htmlable
         return $this->editableCallback;
     }
 
-    public function size(string $size): static
+    // size()/sm()/md()/lg()/getSize() come from Foundation\Concerns\HasSize and
+    // now control the column's structural size. Text font-size moved to the
+    // dedicated textSize() setter below (breaking change in v2).
+
+    public function textSize(string $size): static
     {
         $this->textSize = $size;
 
@@ -1393,9 +1360,9 @@ class Column extends DataComponent implements Htmlable
 
     // Column filtering methods
 
-    public function textColor(string $color): static
+    public function textColor(string|Color $color): static
     {
-        $this->textColor = $color;
+        $this->textColor = $color instanceof Color ? $color->value : $color;
 
         return $this;
     }
@@ -1426,14 +1393,12 @@ class Column extends DataComponent implements Htmlable
      */
     public function filterable(bool $filterable = true, string $type = 'text', array $options = []): static
     {
-        $this->filterable = $filterable;
-        $this->filterType = $type;
-        $this->filterOptions = $options;
-
-        // Bridge to capability system
-        $this->capabilities = $this->filterable
+        $this->capabilities = $filterable
             ? $this->capabilities->add(Capability::Filterable)
             : $this->capabilities->remove(Capability::Filterable);
+
+        $this->filterType = $type;
+        $this->filterOptions = $options;
 
         return $this;
     }
@@ -1445,7 +1410,7 @@ class Column extends DataComponent implements Htmlable
      */
     public function filterAsSelect(array $options, ?string $placeholder = null): static
     {
-        $this->filterable = true;
+        $this->capabilities = $this->capabilities->add(Capability::Filterable);
         $this->filterType = 'select';
         $this->filterOptions = $options;
         if ($placeholder) {
@@ -1460,7 +1425,7 @@ class Column extends DataComponent implements Htmlable
      */
     public function filterAsDate(?string $minDate = null, ?string $maxDate = null): static
     {
-        $this->filterable = true;
+        $this->capabilities = $this->capabilities->add(Capability::Filterable);
         $this->filterType = 'date';
         $this->filterMinDate = $minDate;
         $this->filterMaxDate = $maxDate;
@@ -1473,7 +1438,7 @@ class Column extends DataComponent implements Htmlable
      */
     public function filterAsDateRange(?string $minDate = null, ?string $maxDate = null): static
     {
-        $this->filterable = true;
+        $this->capabilities = $this->capabilities->add(Capability::Filterable);
         $this->filterType = 'date_range';
         $this->filterMinDate = $minDate;
         $this->filterMaxDate = $maxDate;
@@ -1486,7 +1451,7 @@ class Column extends DataComponent implements Htmlable
      */
     public function filterAsNumberRange(?float $min = null, ?float $max = null, ?float $step = null): static
     {
-        $this->filterable = true;
+        $this->capabilities = $this->capabilities->add(Capability::Filterable);
         $this->filterType = 'number_range';
         $this->filterMinValue = $min;
         $this->filterMaxValue = $max;
@@ -1500,7 +1465,7 @@ class Column extends DataComponent implements Htmlable
      */
     public function filterAsBoolean(?string $trueLabel = null, ?string $falseLabel = null): static
     {
-        $this->filterable = true;
+        $this->capabilities = $this->capabilities->add(Capability::Filterable);
         $this->filterType = 'boolean';
         $this->filterTrueLabel = $trueLabel;
         $this->filterFalseLabel = $falseLabel;
@@ -1576,7 +1541,7 @@ class Column extends DataComponent implements Htmlable
 
     public function isFilterable(): bool
     {
-        return $this->filterable;
+        return $this->hasCapability(Capability::Filterable);
     }
 
     public function getFilterType(): string
@@ -1624,7 +1589,7 @@ class Column extends DataComponent implements Htmlable
 
         // 1. Custom filter callback takes priority
         if ($this->filterQueryCallback) {
-            return call_user_func($this->filterQueryCallback, $query, $value);
+            return ($this->filterQueryCallback)($query, $value);
         }
 
         $column = $this->name;
@@ -1748,12 +1713,9 @@ class Column extends DataComponent implements Htmlable
         return $this->getColumnName();
     }
 
-    /**
-     * @throws Throwable
-     */
     public function renderFilter(mixed $value = null): string
     {
-        if (! $this->filterable) {
+        if (! $this->isFilterable()) {
             return '';
         }
 

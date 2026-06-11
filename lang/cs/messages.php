@@ -30,6 +30,7 @@ return [
     'empty_no_records_match' => 'Žádné záznamy neodpovídají vašemu hledání. Zkuste upravit filtry.',
 
     // Filters
+    'filters' => 'Filtry',
     'filter_all' => 'Vše',
     'filter_yes' => 'Ano',
     'filter_no' => 'Ne',
@@ -48,6 +49,16 @@ return [
     'summary_max' => 'Max',
     'summary_range' => 'Rozsah',
     'summary_total' => 'Celkem',
+    'summary_distinct' => 'Různých',
+    'summary_median' => 'Medián',
+    'summary_variance' => 'Rozptyl',
+    'summary_stddev' => 'Sm. odchylka',
+    'summary_first' => 'První',
+    'summary_last' => 'Poslední',
+    'summary_scope_label' => 'Zobrazeno:',
+    'summary_scope_query' => 'Vše',
+    'summary_scope_page' => 'Tato stránka',
+    'summary_scope_selection' => 'Výběr',
 
     // Column
     'copied' => 'Zkopírováno!',
@@ -86,6 +97,8 @@ return [
     'reset' => 'Reset',
     'no_sub_rows' => 'Žádné podzáznamy',
     'details' => 'Detail',
+    'actions' => 'Akce',
+    'show_more_count' => 'Zobrazit dalších :count',
 
     // Inline editable
     'save_failed' => 'Uložení selhalo',
