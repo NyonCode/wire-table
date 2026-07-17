@@ -2,10 +2,12 @@
 
 declare(strict_types=1);
 
-namespace NyonCode\WireTable\Columns;
+namespace NyonCode\WireTable\Services;
 
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
+use NyonCode\WireTable\Columns\Column;
+use NyonCode\WireTable\Columns\SummaryType;
 
 /**
  * Batches SQL-native, query-scoped column summaries into a single aggregate
@@ -20,7 +22,7 @@ use Illuminate\Database\Eloquent\Model;
  *                          table, so withSum/withCount aliases are addressable
  *
  * Summaries that cannot be expressed this way fall back to the existing
- * per-summary path in {@see HasSummary::computeSingleSummary()}: closure
+ * per-summary path in {@see SummaryCalculator::compute()}: closure
  * types, non-SQL-native types (median, stddev, …), summaries with a when()
  * restriction, and dot-notation relation columns.
  *
@@ -29,6 +31,8 @@ use Illuminate\Database\Eloquent\Model;
  */
 final class SummaryBatch
 {
+    public function __construct(private readonly SummaryCalculator $calculator) {}
+
     /**
      * Compute batchable summaries for the given columns.
      *
@@ -37,7 +41,7 @@ final class SummaryBatch
      * @param  array<int, string>  $scopes  Summary scopes eligible for batching
      * @return array<string, array<int, mixed>> [columnName => [summaryIndex => value]]
      */
-    public static function compute(array $columns, Builder $query, array $scopes = ['query']): array
+    public function compute(array $columns, Builder $query, array $scopes = ['query']): array
     {
         $grammar = $query->getQuery()->getGrammar();
 
@@ -129,13 +133,13 @@ final class SummaryBatch
         $results = [];
 
         if ($plainSelects !== []) {
-            $row = self::runPlain($query, $plainSelects);
-            self::collect($results, $plainTargets, $row);
+            $row = $this->runPlain($query, $plainSelects);
+            $this->collect($results, $plainTargets, $row);
         }
 
         if ($rollupSelects !== []) {
-            $row = self::runRollup($query, $rollupSelects);
-            self::collect($results, $rollupTargets, $row);
+            $row = $this->runRollup($query, $rollupSelects);
+            $this->collect($results, $rollupTargets, $row);
         }
 
         return $results;
@@ -147,37 +151,35 @@ final class SummaryBatch
      * @param  Builder<Model>  $query
      * @param  array<string, string>  $selects  alias => expression
      */
-    private static function runPlain(Builder $query, array $selects): ?object
+    private function runPlain(Builder $query, array $selects): ?object
     {
         $base = (clone $query)->toBase();
         $base->reorder();
         $base->select([]);
-        $base->selectRaw(self::compileSelects($selects));
+        $base->selectRaw($this->compileSelects($selects));
 
         return $base->first();
     }
 
     /**
      * Run the aggregates over the query wrapped as a derived table, so rollup
-     * aliases (e.g. items_sum_total) become addressable — same construction as
-     * {@see HasSummary::wrapAggregateQuery()}.
+     * aliases (e.g. items_sum_total) become addressable. The wrapping itself is
+     * {@see SummaryCalculator::wrap()}'s — this used to rebuild it by hand.
      *
      * @param  Builder<Model>  $query
      * @param  array<string, string>  $selects  alias => expression
      */
-    private static function runRollup(Builder $query, array $selects): ?object
+    private function runRollup(Builder $query, array $selects): ?object
     {
-        return $query->toBase()
-            ->newQuery()
-            ->fromSub($query->toBase(), 'wire_table_summary')
-            ->selectRaw(self::compileSelects($selects))
+        return $this->calculator->wrap($query)
+            ->selectRaw($this->compileSelects($selects))
             ->first();
     }
 
     /**
      * @param  array<string, string>  $selects  alias => expression
      */
-    private static function compileSelects(array $selects): string
+    private function compileSelects(array $selects): string
     {
         $parts = [];
 
@@ -194,7 +196,7 @@ final class SummaryBatch
      * @param  array<string, array<int, mixed>>  $results
      * @param  array<int, array{column: Column, index: int, type: SummaryType, aliases: array<int, string>}>  $targets
      */
-    private static function collect(array &$results, array $targets, ?object $row): void
+    private function collect(array &$results, array $targets, ?object $row): void
     {
         foreach ($targets as $target) {
             /** @var Column $column */

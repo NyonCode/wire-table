@@ -9,7 +9,7 @@ use NyonCode\WireCore\Core\Metadata\ColumnMetadata;
 use NyonCode\WireCore\Core\Metadata\MetadataRegistry;
 use NyonCode\WireCore\Core\Metadata\RelationMetadata;
 use NyonCode\WireTable\Columns\Column;
-use NyonCode\WireTable\Concerns\TableQueryService;
+use NyonCode\WireTable\Services\TableQueryService;
 
 // ─── Test Models (no schema needed — we never hit the DB here) ───────────────
 

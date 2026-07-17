@@ -7,7 +7,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 use NyonCode\WireTable\Columns\TextColumn;
-use NyonCode\WireTable\Concerns\TableQueryService;
+use NyonCode\WireTable\Services\TableQueryService;
 use NyonCode\WireTable\Table;
 
 /**
