@@ -100,7 +100,7 @@ class NumberRangeFilter extends Filter
         }
 
         if ($this->queryCallback) {
-            return ($this->queryCallback)($query, $value);
+            return $this->applyQueryCallback($query, $this->normalizeValue($value), $value);
         }
 
         $column = $this->getColumn();
@@ -160,18 +160,6 @@ class NumberRangeFilter extends Filter
                 ->numeric()
                 ->placeholder($this->getMaxLabel()),
         ];
-    }
-
-    public function render(mixed $value = null): string
-    {
-        if (! $this->canView()) {
-            return '';
-        }
-
-        return view($this->resolveFilterView('tables.filters.form-field'), [
-            'filter' => $this,
-            'value' => $value,
-        ])->render();
     }
 
     public function wrapValue(mixed $value): mixed

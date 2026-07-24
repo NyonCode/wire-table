@@ -7,6 +7,7 @@ namespace NyonCode\WireTable\Filters;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use NyonCode\WireCore\Core\Query\FilterDefinition;
+use NyonCode\WireCore\Foundation\Concerns\HasDebounce;
 use NyonCode\WireForms\Components\TextInput;
 
 /**
@@ -21,12 +22,12 @@ use NyonCode\WireForms\Components\TextInput;
  */
 class TextFilter extends Filter
 {
+    use HasDebounce;
+
     /**
      * Supported: like, starts_with, ends_with, equals/=, >, >=, <, <=, !=.
      */
     protected string $operator = 'like';
-
-    protected ?int $debounce = null;
 
     /** Set the comparison operator (like, starts_with, ends_with, =, >, >=, <, <=, !=). */
     public function operator(string $operator): static
@@ -42,21 +43,6 @@ class TextFilter extends Filter
     }
 
     /**
-     * Debounce (ms) for the live text input.
-     */
-    public function debounce(?int $ms): static
-    {
-        $this->debounce = $ms;
-
-        return $this;
-    }
-
-    public function getDebounce(): ?int
-    {
-        return $this->debounce;
-    }
-
-    /**
      * @param  Builder<Model>  $query
      * @return Builder<Model>
      */
@@ -67,7 +53,7 @@ class TextFilter extends Filter
         }
 
         if ($this->queryCallback) {
-            return ($this->queryCallback)($query, $value);
+            return $this->applyQueryCallback($query, $this->normalizeValue($value), $value);
         }
 
         // Crafted/stale state can deliver an array here; guard against
