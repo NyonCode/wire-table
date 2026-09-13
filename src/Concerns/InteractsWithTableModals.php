@@ -7,7 +7,6 @@ namespace NyonCode\WireTable\Concerns;
 use Illuminate\Database\Eloquent\Model;
 use NyonCode\WireCore\Actions\Action;
 use NyonCode\WireCore\Actions\BaseAction;
-use NyonCode\WireCore\Core\Support\Deprecation;
 use NyonCode\WireCore\Foundation\Support\RecordVersion;
 use NyonCode\WireCore\Notifications\Notification;
 
@@ -18,11 +17,10 @@ use NyonCode\WireCore\Notifications\Notification;
  * the action a given frame belongs to. A host concern for the same reason
  * {@see InteractsWithTableActions} is: it works on the component's state container.
  *
- * The block at the bottom is filed under "legacy confirmation modal", but only
- * half of it is: `confirmTableAction()`, `executeConfirmedAction()` and
- * `closeConfirmationModal()` are the pre-frame-stack API and are `@deprecated`
- * for v2.0, while the three `*WithData()` methods next to them are live — the
- * halt modal executes through them. The heading is what makes them look alike.
+ * The block at the bottom still reads "legacy confirmation modal", and the three
+ * `*WithData()` methods in it are anything but: the halt modal executes through
+ * them. The pre-frame-stack API that shared the heading — `confirmTableAction()`,
+ * `executeConfirmedAction()`, `closeConfirmationModal()` — was removed in 2.0.
  */
 trait InteractsWithTableModals
 {
@@ -63,7 +61,6 @@ trait InteractsWithTableModals
         $isBulkAction = (bool) $this->getMountedActionState('isBulk');
         $actionName = $this->getMountedActionState('name');
         $recordKey = $this->getMountedActionState('recordKey');
-        $formData = $this->getMountedActionFormData();
 
         if (! $actionName) {
             $this->closeActionModal();
@@ -84,9 +81,10 @@ trait InteractsWithTableModals
 
         $this->validateMountedActionForm();
 
-        // The callback gets what the form would have persisted, not the raw
-        // widget state — the same seam Form::save() runs (ADR 0021).
-        $formData = $this->dehydrateMountedActionFormData($formData);
+        // After validation, never before: validation throws on invalid input, and
+        // a transform with a side effect (a FileUpload storing its upload) must
+        // not run for a submit that is about to be rejected.
+        $formData = $this->dehydrateMountedActionFormData($this->getMountedActionFormData());
 
         $stackVersionBefore = $this->actionStackVersion;
 
@@ -259,7 +257,7 @@ trait InteractsWithTableModals
 
         $table = $this->getTable();
 
-        return $table->getQuery()->where($table->getPrimaryKey(), $key)->first();
+        return $table->getDataSource()->resolveRecord($key)?->unwrap();
     }
 
     // ==========================================
@@ -341,7 +339,7 @@ trait InteractsWithTableModals
         }
 
         $table = $this->getTable();
-        $record = $table->getQuery()->where($table->getPrimaryKey(), $recordKey)->first();
+        $record = $table->getDataSource()->resolveRecord($recordKey)?->unwrap();
 
         if (! $record || ! $action->canExecute($record)) {
             return;
@@ -415,29 +413,5 @@ trait InteractsWithTableModals
         $baseline = $this->getMountedActionState('recordVersion');
 
         return is_string($baseline) ? $baseline : null;
-    }
-
-    /**
-     * @deprecated Use halt modal system instead. Will be removed in v2.0.
-     */
-    public function confirmTableAction(string $recordKey, string $actionName): void
-    {
-        Deprecation::method('confirmTableAction', 'executeActionPipeline with halt');
-    }
-
-    /**
-     * @deprecated Use halt modal system instead. Will be removed in v2.0.
-     */
-    public function executeConfirmedAction(): void
-    {
-        Deprecation::method('executeConfirmedAction', 'submitHaltModal');
-    }
-
-    /**
-     * @deprecated Use halt modal system instead. Will be removed in v2.0.
-     */
-    public function closeConfirmationModal(): void
-    {
-        Deprecation::method('closeConfirmationModal', 'closeHaltModal');
     }
 }

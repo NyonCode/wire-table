@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Illuminate\Auth\GenericUser;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Support\Facades\Gate;
 use NyonCode\WireTable\Columns\TextInputColumn;
 use Workbench\App\Models\User;
@@ -181,11 +182,15 @@ it('can edit by default and respects edit permission with no user', function () 
 });
 
 it('grants edit to Super Admin role', function () {
+    // The signature is the permission package's, not a narrower one of this
+    // test's choosing: the workbench user carries
+    // `nyoncode/laravel-permission-extended`'s `HasRoles`, and an override that
+    // tightened `string $role` would be a fatal at class-declaration time.
     $user = new class extends User
     {
-        public function hasRole(string $role): bool
+        public function hasRole($roles, ?string $guard = null): bool
         {
-            return $role === 'Super Admin';
+            return $roles === 'Super Admin';
         }
     };
     $this->actingAs($user);
@@ -196,12 +201,12 @@ it('grants edit to Super Admin role', function () {
 it('delegates to hasPermissionTo when present', function () {
     $user = new class extends User
     {
-        public function hasRole(string $role): bool
+        public function hasRole($roles, ?string $guard = null): bool
         {
             return false;
         }
 
-        public function hasPermissionTo(string $permission): bool
+        public function hasPermissionTo($permission, ?string $guardName = null): bool
         {
             return $permission === 'edit-tasks';
         }
@@ -213,8 +218,14 @@ it('delegates to hasPermissionTo when present', function () {
 });
 
 it('falls back to the can() gate check', function () {
+    // A user with *no* permission package on it, which is the whole point of
+    // this test: `canEdit()` reaches for `hasRole()` and `hasPermissionTo()`
+    // first, and only a user that has neither gets as far as the gate. The
+    // workbench user used to stand in here and stopped being able to the day it
+    // took the permission trait — which made this pass for a reason it was never
+    // about.
     Gate::define('edit-tasks', fn ($user) => true);
-    $this->actingAs(new User);
+    $this->actingAs(new TicGateOnlyUser);
 
     expect(TextInputColumn::make('a')->editPermission('edit-tasks')->canEdit(ticRecord()))->toBeTrue();
 });
@@ -231,31 +242,53 @@ it('denies when the user has no authorization methods', function () {
 it('trims and nullifies empty values on save', function () {
     $column = TextInputColumn::make('name')->nullable();
 
-    expect($column->formatForSave('  hi  ', ticRecord()))->toBe('hi')
-        ->and($column->formatForSave('   ', ticRecord()))->toBeNull();
+    expect($column->dehydrateState('  hi  ', ticRecord()))->toBe('hi')
+        ->and($column->dehydrateState('   ', ticRecord()))->toBeNull();
 
-    expect(TextInputColumn::make('name')->trim(false)->formatForSave(' keep ', ticRecord()))->toBe(' keep ');
+    expect(TextInputColumn::make('name')->trim(false)->dehydrateState(' keep ', ticRecord()))->toBe(' keep ');
 });
 
 it('parses formatted numbers back to floats on save', function () {
     $column = TextInputColumn::make('price')->money(2, ' ', ',');
 
-    expect($column->formatForSave('1 234,50', ticRecord()))->toBe(1234.5)
-        ->and($column->formatForSave('', ticRecord()))->toBe('');
+    expect($column->dehydrateState('1 234,50', ticRecord()))->toBe(1234.5)
+        ->and($column->dehydrateState('', ticRecord()))->toBe('');
+});
+
+it('reads an amount grouped the other way round', function () {
+    // The column used to strip the thousands separator by name and leave every
+    // other one standing: '1.234,50' became '1.234.50' and saved as 1.234 — a
+    // thousandfold loss, on the value a paste from a spreadsheet produces.
+    $column = TextInputColumn::make('price')->money(2, ' ', ',');
+
+    expect($column->dehydrateState('1.234,50', ticRecord()))->toBe(1234.5)
+        // A lone dot in a comma format is the decimal point — the numeric keypad.
+        ->and($column->dehydrateState('1234.50', ticRecord()))->toBe(1234.5)
+        ->and($column->dehydrateState('-1 234,50', ticRecord()))->toBe(-1234.5)
+        ->and($column->dehydrateState('nonsense', ticRecord()))->toBeNull();
+});
+
+it('writes the same figure whether the cell is editable or read-only', function () {
+    // Both paths go through the one owner now; they used to be two calls that
+    // could drift apart.
+    $column = TextInputColumn::make('price')->money(2, ' ', ',');
+
+    expect($column->formatForDisplay(1234.5, ticRecord()))
+        ->toBe($column->hydrateState(1234.5, ticRecord()));
 });
 
 it('applies case transforms and before-save formatter', function () {
-    expect(TextInputColumn::make('a')->uppercase()->formatForSave('abc', ticRecord()))->toBe('ABC')
-        ->and(TextInputColumn::make('a')->lowercase()->formatForSave('ABC', ticRecord()))->toBe('abc')
-        ->and(TextInputColumn::make('a')->beforeSave(fn ($v) => $v.'!')->formatForSave('x', ticRecord()))->toBe('x!');
+    expect(TextInputColumn::make('a')->uppercase()->dehydrateState('abc', ticRecord()))->toBe('ABC')
+        ->and(TextInputColumn::make('a')->lowercase()->dehydrateState('ABC', ticRecord()))->toBe('abc')
+        ->and(TextInputColumn::make('a')->beforeSave(fn ($v) => $v.'!')->dehydrateState('x', ticRecord()))->toBe('x!');
 });
 
 it('formats numbers and runs the after-load formatter on load', function () {
     $column = TextInputColumn::make('price')->money(2, ' ', ',');
-    expect($column->formatAfterLoad(1234.5, ticRecord()))->toBe('1 234,50');
+    expect($column->hydrateState(1234.5, ticRecord()))->toBe('1 234,50');
 
     $custom = TextInputColumn::make('name')->afterLoad(fn ($v) => strtoupper((string) $v));
-    expect($custom->formatAfterLoad('hi', ticRecord()))->toBe('HI');
+    expect($custom->hydrateState('hi', ticRecord()))->toBe('HI');
 });
 
 it('formats values for readonly display', function () {
@@ -346,3 +379,11 @@ it('renders nothing when the column is not viewable', function () {
 
     expect($html)->toBe('');
 });
+
+/** A user the gate is the only thing that can answer for. */
+class TicGateOnlyUser extends Authenticatable
+{
+    protected $table = 'users';
+
+    protected $guarded = [];
+}

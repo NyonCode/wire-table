@@ -248,8 +248,28 @@ it('flips the baseline from the master toggle', function () {
     expect($test->instance()->expandsSubRowsByDefault())->toBeFalse();
 });
 
-it('keeps toggleFlattenMode working as an alias of the master toggle', function () {
-    $test = Livewire::test(CeSubRowsComponent::class)->call('toggleFlattenMode');
+it('takes the full render, because the setting is shown outside the island', function () {
+    // The chevron that calls this sits in the header row, inside the
+    // `data-region` island, and Livewire targets the nearest enclosing island
+    // automatically — so without opting out, the response would carry the region
+    // alone and the toolbar's "expand on every row" checkbox would keep showing
+    // the old value. Only `verify-subrows-expansion.mjs` saw it; nothing here
+    // could, which is why the opt-out is pinned rather than left to a comment.
+    $test = Livewire::test(CeSubRowsComponent::class)->call('toggleAllRowExpansion');
+
+    $instance = $test->instance();
+
+    // Asserted through the effect, not the flag. The island path answers a click
+    // inside a region by calling `skipRender()`, and this write's whole job is to
+    // make that call a no-op. `shouldSkipIslandsRender()`, which this used to
+    // read, was Livewire's own switch until v4.4.1 removed the pair.
+    $instance->skipRender();
+
+    expect($instance->shouldSkipRender())->toBeFalse();
+});
+
+it('moves the expansion baseline with the master toggle', function () {
+    $test = Livewire::test(CeSubRowsComponent::class)->call('toggleAllRowExpansion');
 
     expect($test->instance()->expandsSubRowsByDefault())->toBeTrue()
         ->and($test->instance()->isRowExpanded('1'))->toBeTrue();
@@ -498,4 +518,44 @@ it('renders no child panel for a rejected parent even when everything starts exp
     expect(substr_count($html, 'wire:key="sub-rows-1"'))->toBe(1)
         ->and($html)->not->toContain('wire:key="sub-rows-2"')
         ->and($html)->toContain('Pen');
+});
+
+// ─── The child count already in memory ───────────────────────────────────────
+
+it('answers the loaded child count without asking the database', function () {
+    // Two things in memory can answer and the order between them is the rule: a
+    // *_count attribute is exact, while a loaded relation holds only as many
+    // rows as it was allowed to load — so under a subRowsLimit, counting the
+    // relation would always report the limit.
+    $component = new CeSubRowsComponent;
+    $component->mountWithTable();
+
+    $withAttribute = CeInvoice::withCount('items')->find(1);
+    expect($component->getLoadedSubRowCount($withAttribute))->toBe(2);
+
+    $loadedOnly = CeInvoice::with('items')->find(1);
+    expect($component->getLoadedSubRowCount($loadedOnly))->toBe(2);
+});
+
+it('answers null when nothing in memory can', function () {
+    // The caller that wants a cheap hint rather than a total — the stacked
+    // card's collapsed "N items" label — renders nothing on null instead of
+    // buying a COUNT per card.
+    $component = new CeSubRowsComponent;
+    $component->mountWithTable();
+
+    expect($component->getLoadedSubRowCount(CeInvoice::find(1)))->toBeNull();
+});
+
+it('answers null for a table with no relation, and for a non-model', function () {
+    // Detail-row mode has no relation to count, and the parameter is `mixed`
+    // because a DataSource record need not be an Eloquent model at all.
+    $detail = new CeDetailComponent;
+    $detail->mountWithTable();
+    expect($detail->getLoadedSubRowCount(CeInvoice::find(1)))->toBeNull();
+
+    $withRelation = new CeSubRowsComponent;
+    $withRelation->mountWithTable();
+    expect($withRelation->getLoadedSubRowCount(['not' => 'a model']))->toBeNull()
+        ->and($withRelation->getLoadedSubRowCount(null))->toBeNull();
 });

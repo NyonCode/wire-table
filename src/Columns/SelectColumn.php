@@ -8,11 +8,13 @@ use Closure;
 use Illuminate\Database\Eloquent\Model;
 use NyonCode\WireCore\Core\Capabilities\Capability;
 use NyonCode\WireCore\Core\Support\Trans;
+use NyonCode\WireCore\Foundation\Concerns\HasRelationship;
 use NyonCode\WireCore\Foundation\Support\EnumResolver;
 use NyonCode\WireCore\Foundation\View\CellSync;
 use NyonCode\WireTable\Concerns\HasRecordVersion;
 use NyonCode\WireTable\Concerns\HasView;
 use NyonCode\WireTable\Concerns\InteractsWithRecordDisabledState;
+use NyonCode\WireTable\Contracts\InheritsRecordState;
 
 /**
  * Inline editable select cell — always a browser-native <select>.
@@ -23,20 +25,15 @@ use NyonCode\WireTable\Concerns\InteractsWithRecordDisabledState;
  * native() / isNative() pair here could only ever be a no-op that reads like a
  * real switch. Better to not offer the choice than to offer a fake one.
  */
-class SelectColumn extends Column
+class SelectColumn extends Column implements InheritsRecordState
 {
     use HasRecordVersion;
+    use HasRelationship;
     use HasView;
     use InteractsWithRecordDisabledState;
 
     /** @var array<string, string> */
     protected array $options = [];
-
-    /** @var string|null Relationship name for auto-loading options */
-    protected ?string $relationship = null;
-
-    /** @var string|null Display attribute on the related model */
-    protected ?string $titleAttribute = null;
 
     /** Guards the one relationship query per render — the list is the same for every row. */
     protected bool $relationshipOptionsLoaded = false;
@@ -110,29 +107,6 @@ class SelectColumn extends Column
     }
 
     /**
-     * Configure relationship for auto-loading options from related model.
-     *
-     * Usage: SelectColumn::make('category_id')->relationship('category', 'name')
-     */
-    public function relationship(string $name, string $titleAttribute): static
-    {
-        $this->relationship = $name;
-        $this->titleAttribute = $titleAttribute;
-
-        return $this;
-    }
-
-    public function getRelationshipName(): ?string
-    {
-        return $this->relationship;
-    }
-
-    public function getTitleAttribute(): ?string
-    {
-        return $this->titleAttribute;
-    }
-
-    /**
      * Fill the option list from relationship() the first time a cell renders.
      *
      * The related list is identical for every row, so this runs once per render
@@ -177,6 +151,11 @@ class SelectColumn extends Column
 
             return $this->options($options);
         } catch (\Throwable) {
+            // Options left as they were, deliberately. This runs per rendered
+            // row to fill a dropdown from a relation, so the failure modes are a
+            // name that is not a relation and a related table that cannot be
+            // queried — neither of which should take the table down. The cell
+            // renders with whatever options were declared by hand.
             return $this;
         }
     }

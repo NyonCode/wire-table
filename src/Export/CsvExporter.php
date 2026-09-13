@@ -6,7 +6,10 @@ namespace NyonCode\WireTable\Export;
 
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
+use NyonCode\WireCore\Core\Query\QueryPlan;
 use NyonCode\WireTable\Columns\Column;
+use NyonCode\WireTable\Data\EloquentDataSource;
+use NyonCode\WireTable\Exceptions\ExportException;
 use NyonCode\WireTable\Export\Contracts\Exporter;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
@@ -20,57 +23,74 @@ class CsvExporter implements Exporter
         protected bool $withHeadings = true,
     ) {}
 
+    public function extension(): string
+    {
+        return 'csv';
+    }
+
     /**
      * @param  Builder<Model>  $query
      * @param  array<int, Column>  $columns
      * @param  array<int, array<int, string>>  $summaryRows
      */
+    public function writeTo(string $path, Builder $query, array $columns, array $summaryRows = []): void
+    {
+        // Suppressed on purpose; {@see ExportException} says why the warning is
+        // replaced rather than ignored.
+        $handle = @fopen($path, 'w');
+
+        if ($handle === false) {
+            throw ExportException::destinationNotWritable($path);
+        }
+
+        // BOM for UTF-8 Excel compatibility
+        fwrite($handle, "\xEF\xBB\xBF");
+
+        if ($this->withHeadings) {
+            fputcsv(
+                $handle,
+                array_map(fn (Column $col) => $col->getLabel(), $columns),
+                $this->delimiter,
+                $this->enclosure,
+            );
+        }
+
+        // Streams through the source, so an export is available over
+        // whatever the table reads from — and still chunked, because get()
+        // would turn a bounded-memory export into an unbounded one. The
+        // qualified-key cursor moved into the source with the call.
+        $writeBatch = function ($records) use ($handle, $columns): void {
+            foreach ($records as $record) {
+                $row = [];
+                foreach ($columns as $column) {
+                    $row[] = $this->resolveColumnValue($column, $record);
+                }
+                fputcsv($handle, $row, $this->delimiter, $this->enclosure);
+            }
+        };
+
+        (new EloquentDataSource($query))->chunk(new QueryPlan, 1000, $writeBatch);
+
+        foreach ($summaryRows as $summaryRow) {
+            fputcsv($handle, array_map([$this, 'escapeFormula'], $summaryRow), $this->delimiter, $this->enclosure);
+        }
+
+        fclose($handle);
+    }
+
     public function export(Builder $query, array $columns, string $fileName, array $summaryRows = []): StreamedResponse
     {
-        return new StreamedResponse(function () use ($query, $columns, $summaryRows) {
-            $handle = fopen('php://output', 'w');
-
-            if ($handle === false) {
-                return;
-            }
-
-            // BOM for UTF-8 Excel compatibility
-            fwrite($handle, "\xEF\xBB\xBF");
-
-            if ($this->withHeadings) {
-                fputcsv(
-                    $handle,
-                    array_map(fn (Column $col) => $col->getLabel(), $columns),
-                    $this->delimiter,
-                    $this->enclosure,
-                );
-            }
-
-            // Pass the qualified key: the export query carries a relation LEFT JOIN
-            // whenever the table is sorted by a relation column, and chunkById's
-            // default unqualified `id` cursor is ambiguous against the joined table.
-            $model = $query->getModel();
-
-            $query->chunkById(1000, function ($records) use ($handle, $columns) {
-                foreach ($records as $record) {
-                    $row = [];
-                    foreach ($columns as $column) {
-                        $row[] = $this->resolveColumnValue($column, $record);
-                    }
-                    fputcsv($handle, $row, $this->delimiter, $this->enclosure);
-                }
-            }, $model->getQualifiedKeyName(), $model->getKeyName());
-
-            foreach ($summaryRows as $summaryRow) {
-                fputcsv($handle, array_map([$this, 'escapeFormula'], $summaryRow), $this->delimiter, $this->enclosure);
-            }
-
-            fclose($handle);
-        }, 200, [
-            'Content-Type' => 'text/csv; charset=UTF-8',
-            'Content-Disposition' => 'attachment; filename="'.$fileName.'"',
-            'Cache-Control' => 'no-cache, no-store, must-revalidate',
-        ]);
+        // `php://output` is a path like any other, so the download is the same
+        // writer inside a response wrapper — not a second copy of it.
+        return new StreamedResponse(
+            fn () => $this->writeTo('php://output', $query, $columns, $summaryRows),
+            200,
+            [
+                'Content-Type' => 'text/csv; charset=UTF-8',
+                'Content-Disposition' => 'attachment; filename="'.$fileName.'"',
+                'Cache-Control' => 'no-cache, no-store, must-revalidate',
+            ],
+        );
     }
 
     protected function resolveColumnValue(Column $column, Model $record): string

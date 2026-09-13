@@ -12,9 +12,11 @@ use Illuminate\Database\Eloquent\Relations\HasOneThrough;
 use Illuminate\Support\Str;
 use NyonCode\WireCore\Core\Metadata\MetadataRegistry;
 use NyonCode\WireCore\Core\Metadata\RelationMetadata;
+use NyonCode\WireCore\Core\Plugin\HookDispatch;
 use NyonCode\WireCore\Core\Plugin\Hooks\TableConfiguringPayload;
 use NyonCode\WireCore\Core\Plugin\Hooks\TableQueriedPayload;
 use NyonCode\WireCore\Core\Plugin\Hooks\TableQueryingPayload;
+use NyonCode\WireCore\Core\Plugin\HookTarget;
 use NyonCode\WireCore\Core\Plugin\PluginManager;
 use NyonCode\WireCore\Core\Query\FilterDefinition;
 use NyonCode\WireCore\Core\Query\JoinRegistry;
@@ -24,6 +26,7 @@ use NyonCode\WireCore\Core\Query\QueryPlanner;
 use NyonCode\WireCore\Core\Query\Search\SearchTermParser;
 use NyonCode\WireCore\Core\Query\SortDefinition;
 use NyonCode\WireCore\Core\Query\StableOrder;
+use NyonCode\WireCore\Foundation\Enums\Hook;
 use NyonCode\WireTable\Columns\Column;
 use NyonCode\WireTable\Filters\Filter;
 use NyonCode\WireTable\Filters\SelectFilter;
@@ -78,25 +81,41 @@ final class TableQueryService
         $modelClass = get_class($baseQuery->getModel());
         $this->currentModelClass = $modelClass;
         $this->registry = $this->buildMetadataRegistry($baseQuery, $modelClass, $table);
+
+        // Not a hook and therefore not asked for by name: the query pipes are a
+        // registry on the manager, so this one is resolved the plain way.
         $pluginManager = $this->resolvePluginManager();
+
+        // Built once and handed to every dispatch below: it is what lets a
+        // callback be scoped to one table — a resource key, the host component,
+        // or the model — instead of running for every table in the application.
+        $hookTarget = HookTarget::for('table', $table->getLivewireComponent(), $modelClass);
 
         $columns = $table->getColumns();
         $filters = $table->getFilters();
 
         // ── 0. Plugin hook: table.configuring ──
-        if ($pluginManager !== null) {
-            $payload = $pluginManager->runHook('table.configuring', [
+        //
+        // One of the seven legacy names, so both dispatchers run. Asked per hook
+        // rather than once for the method: each name gets its own `hasHook()`
+        // short-circuit that way, and this one runs per table per render. The
+        // shared `resolvePluginManager()` below stays for the query pipes, which
+        // are not a hook and have no name to ask about.
+        $configuringManager = HookDispatch::manager(Hook::TableConfiguring);
+
+        if ($configuringManager !== null) {
+            $payload = $configuringManager->runHook('table.configuring', [
                 'table' => $table,
                 'columns' => $columns,
                 'filters' => $filters,
-            ]);
+            ], $hookTarget);
             $columns = $payload['columns'] ?? $columns;
             $filters = $payload['filters'] ?? $filters;
 
             // Typed hook (parallel API — both array and typed hooks run)
-            $typedPayload = $pluginManager->runTypedHook(
+            $typedPayload = $configuringManager->runTypedHook(
                 'table.configuring',
-                new TableConfiguringPayload($table, $columns, $filters),
+                new TableConfiguringPayload($table, $columns, $filters, target: $hookTarget),
             );
             $columns = $typedPayload->columns;
             $filters = $typedPayload->filters;
@@ -208,15 +227,17 @@ final class TableQueryService
             : null;
 
         // ── 2.5 Plugin hook: table.querying (pre-plan, can force sort override) ──
-        if ($pluginManager !== null) {
-            $queryingPayload = $pluginManager->runHook('table.querying', [
+        $queryingManager = HookDispatch::manager(Hook::TableQuerying);
+
+        if ($queryingManager !== null) {
+            $queryingPayload = $queryingManager->runHook('table.querying', [
                 'table' => $table,
                 'columns' => $columns,
                 'filters' => $filters,
                 'sort_column' => $sortColumn,
                 'sort_direction' => $sortDirection,
                 'search' => $search,
-            ]);
+            ], $hookTarget);
 
             // Plugins can force sort override (e.g. SortablePlugin in reorder mode)
             if (isset($queryingPayload['force_sort_column'])) {
@@ -242,16 +263,17 @@ final class TableQueryService
 
         // ── 3.5 Typed plugin hook: table.querying (post-plan, pre-execute) ──
         // Plugins that only need to observe the finished plan (e.g. for logging or
-        // read-only inspection) may use this typed hook.
+        // read-only inspection) may use this typed hook. Its result is not read
+        // back, and that is the whole contract: the plan exists by now, so any
+        // change to it would mean planning the query a second time.
         //
-        // NOTE: Do NOT use forceSortColumn here. Sort overrides must go through the
-        // array-based table.querying hook (step 2.5 above) so they are applied
-        // BEFORE the first plan() call. Setting forceSortColumn in the typed hook
-        // would require re-running the full planner a second time.
-        if ($pluginManager !== null) {
-            $pluginManager->runTypedHook(
+        // A sort override therefore goes on the array hook at step 2.5, which runs
+        // before the planner. The typed payload used to carry forceSortColumn for
+        // it — filled by nothing, read by nothing — and that was removed in 2.0.
+        if ($queryingManager !== null) {
+            $queryingManager->runTypedHook(
                 'table.querying',
-                new TableQueryingPayload($table, $this->lastPlan, $baseQuery),
+                new TableQueryingPayload($table, $this->lastPlan, $baseQuery, target: $hookTarget),
             );
         }
 
@@ -359,16 +381,18 @@ final class TableQueryService
         app(StableOrder::class)->apply($query);
 
         // ── 6. Plugin hook: table.queried (post-execution observation) ──
-        if ($pluginManager !== null) {
-            $pluginManager->runHook('table.queried', [
+        $queriedManager = HookDispatch::manager(Hook::TableQueried);
+
+        if ($queriedManager !== null) {
+            $queriedManager->runHook('table.queried', [
                 'table' => $table,
                 'query' => $query,
                 'plan' => $this->lastPlan,
-            ]);
+            ], $hookTarget);
 
-            $pluginManager->runTypedHook(
+            $queriedManager->runTypedHook(
                 'table.queried',
-                new TableQueriedPayload($table, $query, $this->lastPlan),
+                new TableQueriedPayload($table, $query, $this->lastPlan, target: $hookTarget),
             );
         }
 
@@ -503,6 +527,12 @@ final class TableQueryService
 
                 $current = $relatedModel;
             } catch (\Throwable) {
+                // A probe, not a call that must succeed: this walks a dot path
+                // segment by segment to learn what it can join, and a segment
+                // that is not a real relation (or needs state to resolve) simply
+                // ends the walk. The registry keeps whatever the earlier
+                // segments taught it and the planner falls back to eager loading
+                // for the rest — nothing the caller asked for is discarded.
                 return;
             }
         }
@@ -664,8 +694,18 @@ final class TableQueryService
             return [];
         }
 
+        // Ask the column what it orders by rather than reusing the name the
+        // header was clicked under. For an ordinary column the two are the same
+        // string; for a composite one they are not, and a SplitColumn named for
+        // the group it draws would otherwise reach SQL as a column that does
+        // not exist.
+        $sortTarget = $columnObj->getSortColumn();
+        if ($sortTarget === null) {
+            return [];
+        }
+
         return [SortDefinition::make(
-            column: $columnObj->getName(),
+            column: $sortTarget,
             direction: $sortDirection,
         )];
     }

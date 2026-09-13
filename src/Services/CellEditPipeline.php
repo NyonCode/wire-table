@@ -6,9 +6,13 @@ namespace NyonCode\WireTable\Services;
 
 use Illuminate\Database\Eloquent\Model;
 use NyonCode\WireCore\Core\Events\CellUpdated;
+use NyonCode\WireCore\Core\Plugin\HookDispatch;
+use NyonCode\WireCore\Core\Plugin\Hooks\CellUpdatingPayload;
+use NyonCode\WireCore\Core\Plugin\HookTarget;
 use NyonCode\WireCore\Core\Validation\ValidationPipeline;
 use NyonCode\WireCore\Foundation\Contracts\DehydratesState;
 use NyonCode\WireCore\Foundation\Contracts\HydratesState;
+use NyonCode\WireCore\Foundation\Enums\Hook;
 use NyonCode\WireCore\Foundation\Support\RecordVersion;
 use NyonCode\WireTable\Columns\Column;
 use NyonCode\WireTable\Support\CellEditOutcome;
@@ -119,6 +123,56 @@ final class CellEditPipeline
     }
 
     /**
+     * Validate a value against a record, without writing anything.
+     *
+     * The live check behind an editable cell: the client asks "would this
+     * save?" while the user is still typing, so it must see the same rules and
+     * the same dehydrated value the commit would — a check that validates the
+     * raw input and then stores something else has told the user nothing.
+     *
+     * Which is why this shares {@see dehydrate()} rather than repeating it.
+     * Its previous home spelled `$column->dehydrateState($value, $record)` out
+     * again, and a second copy of a rule is a rule that will diverge from the
+     * commit path without anything failing.
+     *
+     * A column carrying its own `validate()` — `TextInputColumn` does — answers
+     * for itself; that is the column's contract, not something to route around.
+     *
+     * @return array{valid: bool, errors: array<int, string>}
+     */
+    public function validateAgainstRecord(Column $column, string $columnName, mixed $value, Model $record): array
+    {
+        $value = $this->dehydrate($column, $value, $record);
+
+        if (method_exists($column, 'validate')) {
+            /** @var array{valid: bool, errors: array<int, string>} $result */
+            $result = $column->validate($value, $record);
+
+            return $result;
+        }
+
+        $rules = $column->getEditableRules($record);
+
+        if ($rules === []) {
+            return ['valid' => true, 'errors' => []];
+        }
+
+        $result = $this->validator->validate(
+            [$columnName => $value],
+            [$columnName => $rules],
+        );
+
+        if (! $result->failed()) {
+            return ['valid' => true, 'errors' => []];
+        }
+
+        return [
+            'valid' => false,
+            'errors' => $result->getError($columnName) ?? [],
+        ];
+    }
+
+    /**
      * The record-aware half: per-record permission, optimistic lock, the
      * record-aware dehydrate and validation, then the write.
      *
@@ -168,6 +222,32 @@ final class CellEditPipeline
                     $validation['errors'],
                 );
             }
+        }
+
+        // The one seam an inline edit had none of. Last, deliberately: the
+        // column's own permission check, the optimistic-lock check and its
+        // validation have all run, so a callback narrows what is written and
+        // cannot widen past a guard the column declared — the ordering
+        // `search.querying` follows around its policy check.
+        //
+        // Here rather than in the two callers: the inline editor and the fill
+        // handle both funnel through this method, and a hook on one of them would
+        // be a rule that a drag across a column quietly escapes.
+        $payload = HookDispatch::typed(Hook::CellUpdating, fn () => new CellUpdatingPayload(
+            column: $column,
+            columnName: $columnName,
+            record: $record,
+            value: $value,
+            oldValue: $oldValue,
+            target: HookTarget::for('cell', null, $record),
+        ));
+
+        if ($payload !== null) {
+            if ($payload->refusal !== null) {
+                return CellEditOutcome::rejected($payload->refusal);
+            }
+
+            $value = $payload->value;
         }
 
         $record = $this->writer->write($column, $record, $columnName, $value);

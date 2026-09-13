@@ -8,317 +8,100 @@
     /** @var LengthAwarePaginator|Collection $records */
     /** @var mixed $component */
 
-    $isLazy = $table->isLazy();
-    $isTableReady = $component->isTableReady();
-    $lazyPlaceholder = $table->getLazyPlaceholder();
+    // What this render resolved, in PHP. Asked for here rather than handed in,
+    // because a view may reconfigure the table before this one renders — see
+    // WithTable::tableRenderPlan(), and wire-sortable's column order for the case
+    // that proves it.
+    $plan = $component->tableRenderPlan();
 
-    // Polling
-    $pollingConfig = $component->getTablePollingConfig();
-    $pollingAttribute = $component->getTablePollingAttribute();
-
-    // live(broadcast: true): re-read as soon as somebody else commits, instead
-    // of on the next tick. Null without the opt-in, so a table that did not ask
-    // for it ships no listener and needs no channel authorization.
-    $liveChannel = $component->getTableLiveChannel();
-
-    // Table state — read once via the state container; the legacy magic
-    // properties ($component->tableFilters, …) build the deprecation map on
-    // every access and must not be used in per-row/per-column loops.
-    // Floating filter/column-toggle panels present as a bottom sheet on mobile
-    // unless disabled via Table::sheetOnMobile(false) or the global config.
-    $sheetOnMobile = $table->usesSheetOnMobile();
-    $sheetBp = $table->getMobileBreakpoint();
-    $sheetBpPx = \NyonCode\WireCore\Foundation\Support\MobileSheet::px($sheetBp);
-    $sheetPanel = \NyonCode\WireCore\Foundation\Support\MobileSheet::panel($sheetBp);
-    $sheetMotion = \NyonCode\WireCore\Foundation\Support\MobileSheet::motion($sheetBp);
-    $sheetBackdrop = \NyonCode\WireCore\Foundation\Support\MobileSheet::backdropHide($sheetBp);
-    $tableSearch = $component->tableState->get('search');
-    $tableFilters = $component->tableState->get('filters', []) ?? [];
-    $columnFilterValues = $component->tableState->get('columnFilters', []) ?? [];
-    $sortColumn = $component->tableState->get('sort.column');
-    $sortDirection = $component->tableState->get('sort.direction', 'asc');
-    $perPage = (int) $component->tableState->get('pagination.perPage', $table->getPerPage());
-    // Treat a filter as active only when it holds a real value. A range filter
-    // that was typed then cleared leaves ['min' => '', 'max' => ''] — a truthy
-    // array that plain array_filter would wrongly count as active.
-    $filterHasValue = function ($value) use (&$filterHasValue) {
-        if (is_array($value)) {
-            foreach ($value as $inner) {
-                if ($filterHasValue($inner)) {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        return $value !== null && $value !== '';
-    };
-    $activeTableFilters = array_filter($tableFilters, $filterHasValue);
-    $activeColumnFilters = array_filter($columnFilterValues, $filterHasValue);
-
-    $actions = $table->getRowActionsForDisplay(); // applies the configured row-action style (solid/quiet)
-    $bulkActions = $table->getBulkActions();
-    $headerActions = $table->getHeaderActions();
-    $filters = $table->getFilters();
-
-    $hasActions = $table->hasActions();
-    // The stacked cards have their own action list: a finger has no double-click,
-    // no right-click and no Delete key, so a behaviour-only record action also
-    // renders here as an ordinary button (recordActionButtonsOnMobile()).
-    $mobileActions = $table->getMobileRowActionsForDisplay();
-    $hasMobileActions = $mobileActions !== [];
-    // Mobile stacked cards can collapse the row actions into one dropdown group.
-    $collapseMobileActions = $table->shouldCollapseActionsOnMobile();
-    $mobileActionGroup = $collapseMobileActions ? $table->getMobileActionGroup() : null;
-    // The toolbar can do the same with its header actions. Both halves sit in the
-    // document at every width; CSS decides which one is shown, which is why the
-    // collapsed copy renders shortcut-less (see getMobileHeaderActionGroup()).
-    $collapseHeaderActions = $table->shouldCollapseHeaderActionsOnMobile();
-    $mobileHeaderActionGroup = $collapseHeaderActions ? $table->getMobileHeaderActionGroup() : null;
-    $headerActionClick = $collapseHeaderActions ? new \NyonCode\WireTable\Actions\HeaderActionClickResolver() : null;
-    // Host click resolver: the single place that maps a row action to the table's
-    // executeTableAction/openActionModal (core action views stay host-agnostic).
-    $actionClick = new \NyonCode\WireTable\Actions\TableActionClickResolver();
-    $rowContextMenuEnabled = $table->hasRowContextMenu(); // dedicated actions, independent of the actions column
-    // Record actions: whole-row click/dblclick bindings (name map) + whether the
-    // delegated controller must be mounted at all (bindings, a context menu, or
-    // keyboard navigation).
-    $recordActionBindings = $table->getRecordActionBindings();
-    $hasRecordPointer = $recordActionBindings !== [];
-    $keyboardNav = $table->keyboardNavEnabled();
-    $tableRole = $table->getTableRole();
-    $recordKeyboardConfig = $keyboardNav ? $table->getRecordActionKeyboardConfig() : null;
-    // The controller mount has its own owner: grid semantics (role/tabindex)
-    // now cover selectable tables too, but mounting wireRecordActions there is
-    // a visible change that ships separately — see mountsRecordActionController().
-    $recordActionsRootEnabled = $table->mountsRecordActionController();
-    // The mouse half of the gesture layer (sweep, Shift/mod ranges) — switchable
-    // independently of the keyboard one, so the controller gets its own config.
-    $gestureConfig = $table->getGestureConfig();
-    $usesRangeSelection = $table->usesRangeSelection();
-    // The marker only exists where something continues from the marked row: the
-    // keyboard, a range or a sweep. A table left with a bare click binding runs
-    // the action and highlights nothing.
-    $activeRowConfig = $table->usesActiveRowMarker() ? $table->getActiveRowConfig() : null;
-    // `?` opens the shortcut help. The event name is derived from the component
-    // id, so a page with several tables opens only the one whose row has focus —
-    // a bare window event would open every help modal at once. It goes through
-    // a lowercase hash, because the listener lives in an ATTRIBUTE NAME
-    // (x-on:{event}.window) and the DOM lowercases those: a mixed-case Livewire
-    // id would never match what the controller dispatches. The controller learns
-    // the name through its keyboard config; a table whose legend is empty gets
-    // no event and no modal at all.
-    $shortcutLegend = $table->usesShortcutHelp() ? $table->shortcutLegend() : null;
-    $shortcutHelpEvent = $shortcutLegend !== null && ! $shortcutLegend->isEmpty()
-        ? 'wire-table-shortcut-help-'.substr(md5($component->getId()), 0, 12)
-        : null;
-
-    if ($recordKeyboardConfig !== null) {
-        $recordKeyboardConfig['help'] = $shortcutHelpEvent;
-    }
-    $hasBulkActions = !empty($bulkActions);
-    $hasHeaderActions = !empty($headerActions);
-    $hasFilters = !empty($filters);
-    $isSelectable = $table->isSelectable();
-    // Record-invariant chrome icon resolved once per render (IconManager owns the
-    // SVG cache); the card view's select-all echoes the string instead of re-entering
-    // @icon. The row's own selection cell gets it from the same owner, baked into its
-    // skeleton — see Table::getSelectionCellSkeleton().
-    $selectCheckIcon = $isSelectable ? $table->getSelectionCheckIcon() : '';
-    $hasSummaries = $component->tableHasSummaries();
-
-    // One `:class` expression per row, merging every dynamic row state that has
-    // to survive a Livewire morph: the selection tint and the record-action
-    // active marker. Both are Alpine bindings rather than classes toggled from
-    // JS, so the roundtrip a click triggers cannot wash them off. `rowClass()`
-    // returns an object (it also switches the row's hover tint off while it is
-    // the active row); `%key%` is substituted with the record key per row.
-    $rowClassBindingParts = [];
-    if ($isSelectable) {
-        $rowClassBindingParts[] = "'bg-primary-50 dark:bg-primary-900/20': isSelected(%key%)";
-    }
-    if ($activeRowConfig !== null) {
-        $rowClassBindingParts[] = '...rowClass(%key%)';
-    }
-    $rowClassBinding = $rowClassBindingParts === []
-        ? null
-        : '{ '.implode(', ', $rowClassBindingParts).' }';
-
-    // Selection is managed client-side (Alpine) and entangled deferred — a
-    // checkbox click costs no server roundtrip. When the footer renders
-    // summaries, changes are committed (debounced) so selection-scope totals
-    // and the scope toggle stay correct.
-    $pageRecordKeys = [];
-    if ($isSelectable) {
-        foreach ($records as $pageRecord) {
-            $pageRecordKeys[] = (string) $pageRecord->{$table->getPrimaryKey()};
-        }
-    }
-    $selectionSyncLive = $isSelectable && $hasSummaries;
-    $isPaginated = $table->isPaginated();
-    $visibleColumns = array_filter($table->getColumns(), fn($c) => $c->canView() && $component->isColumnVisible($c->getName()));
-    $hasVisibleColumns = count($visibleColumns) > 0;
-    // Column-static render metadata: resolved once per column here instead of
-    // re-calling these getters for every cell (N rows × M columns → M). Reused by
-    // the header and body. Keyed by column name.
-    $columnMeta = [];
-    foreach ($visibleColumns as $col) {
-        $columnMeta[$col->getName()] = [
-            'wrapClass' => $col->shouldWrap() ? '' : 'whitespace-nowrap',
-            'alignment' => $col->getAlignmentClass(),
-            'responsive' => $col->getResponsiveClasses(),
-            'editable' => $col->isEditable(),
-            'responsiveDisplay' => $col->hasResponsiveDisplay(),
-            // Author-supplied cell/header attributes. Resolved here with the rest
-            // of the column-static metadata rather than per cell; both setters
-            // stored their value and nothing read it until now.
-            'extraCell' => $col->getExtraAttributes(),
-            'extraHeader' => collect($col->getExtraHeaderAttributes())
-                ->map(fn ($v, $k) => e($k).'="'.e($v).'"')
-                ->implode(' '),
-        ];
-    }
-    // Columns a fill drag may write. The client additionally requires the cell to
-    // have actually rendered an editable root, so a per-record disabled cell is
-    // skipped without this list having to know about records.
-    $fillColumns = array_values(array_map(
-        fn($c) => $c->getName(),
-        array_filter($visibleColumns, fn($c) => $c->isFillable()),
-    ));
-    $isFillEnabled = $table->isFillHandleEnabled() && $fillColumns !== [];
-    $filterableColumns = array_filter($table->getColumns(), fn($c) => $c->canView() && $c->isFilterable() && $component->isColumnVisible($c->getName()));
-    $hasColumnFilters = count($filterableColumns) > 0;
-    $hasSubRows = $table->hasSubRows();
-    $isSubRowsExpandable = $hasSubRows && $table->isSubRowsExpandable();
-    $allRowsExpanded = $hasSubRows && $component->expandsSubRowsByDefault();
-    $hasGrouping = $table->hasGrouping();
-    $hasGroupSummaries = $hasGrouping && $component->tableHasGroupSummaries();
-    $subRowColumns = $hasSubRows ? $table->getSubRowColumns() : [];
-    $visibleSubRowColumns = $hasSubRows ? array_filter($subRowColumns, fn($c) => $c->canView()) : [];
-    // Whether any cell on this table renders a copy button, and so whether the
-    // delegated clipboard controller is worth shipping. Sub-rows are included: they
-    // render through the same column partials, and the controller is one listener
-    // for the document either way.
-    $hasCopyableColumn = array_filter($visibleColumns, fn($c) => $c->isCopyable()) !== []
-        || array_filter($visibleSubRowColumns, fn($c) => $c->isCopyable()) !== [];
-    $colSpan = ($isSelectable ? 1 : 0) + count($visibleColumns) + ($hasActions ? 1 : 0) + ($hasSubRows ? 1 : 0);
-    $toggleableColumns = array_filter($table->getColumns(), fn($c) => $c->isToggleable() && $c->canView());
-    $visibleToggleableCount = count(array_filter($toggleableColumns, fn($c) => $component->isColumnVisible($c->getName())));
-    // Sorting on a phone: the stacked card view hides the header row that holds
-    // the sort buttons, so the control has to exist somewhere else.
-    $mobileSortableColumns = ($table->isStackedOnMobile() && $table->isSortable())
-        ? array_values(array_filter($visibleColumns, fn($c) => $c->isSortable()))
-        : [];
-    $hasMobileSort = count($mobileSortableColumns) > 0;
-
-    // The view menu earns its place from either section it can hold.
-    $hasColumnToggles = count($toggleableColumns) > 0;
-    $hasViewMenu = $hasColumnToggles || $isSubRowsExpandable;
-    $viewMenuLabel = $hasColumnToggles && ! $isSubRowsExpandable
-        ? __('wire-table::messages.toggle_columns')
-        : __('wire-table::messages.view_options');
-
-    // Action configuration
-    $actionsPosition = $table->getActionsPosition(); // 'start' or 'end'
-    $actionsAlignment = $table->getActionsAlignment(); // 'left', 'center', 'right'
-    $actionsAlignmentClass = $table->getActionsAlignmentClass(); // literal text-* utility
-    $actionsJustifyClass = $table->getActionsJustifyClass(); // literal justify-* utility
-    $actionsColumnLabel = $table->getActionsColumnLabel() ?? __('wire-table::messages.actions_label');
-    $actionsColumnWidth = $table->getActionsColumnWidth();
-
-    // Table styling
-    $isCompact = $table->isCompact();
-    $isBordered = $table->isBordered();
-    // Row hover/striping/tint now composed in Table::getRowClasses($record, $rowIndex).
-    // Density map owned by the Table, so a cell rendered outside this view (the
-    // selection cell's partial) cannot drift from the ones rendered inside it.
-    $cellPadding = $table->getCellPadding();
-    $headerPadding = $table->getHeaderPadding();
-
-    // The body cell, compiled once per column instead of interpolated once per cell.
+    // This is the WRAPPER's half of the plan. The table, the stacked cards and the
+    // pagination footer moved to partials/data-region.blade.php, which is an
+    // ISLAND: Livewire renders an island body from its own view file, with the
+    // component and its public properties and nothing else, so it cannot inherit
+    // one line of what follows. It reads its own half from the same plan.
     //
-    // Every attribute on it is column-static — only what goes BETWEEN the tags varies
-    // by record — so a 50×10 page was re-emitting the same ten opening tags five
-    // hundred times. The markup lives in `tables.partials.body-cell`, rendered once
-    // per column here with a slot where the record's content goes; the row loop fills
-    // it. That also lets a cell be emitted with no whitespace between its tags: each
-    // run of whitespace is one DOM text node, and the morph walks every one of them
-    // on every commit (see TablePayloadFuseTest).
-    $cellBorderClass = $isBordered ? 'border border-gray-200 dark:border-gray-700' : '';
-    foreach ($columnMeta as $name => $meta) {
-        $columnMeta[$name]['cell'] = \NyonCode\WireCore\Foundation\View\Skeleton::compile(
-            view('wire-table::tables.partials.body-cell', [
-                'cellPadding' => $cellPadding,
-                'wrapClass' => $meta['wrapClass'],
-                'borderClass' => $cellBorderClass,
-                'alignment' => $meta['alignment'],
-                'responsive' => $meta['responsive'],
-                'name' => $name,
-                'extraAttributes' => $meta['extraCell'],
-                'content' => \NyonCode\WireCore\Foundation\View\Skeleton::slot('content'),
-            ])->render(),
-            'content',
-        );
-    }
+    // What is left here is everything the region does not touch: the toolbar and
+    // its panels, the selection root, the polling wrapper and the modals.
 
-    // Responsive layout — class maps owned by the Table (literal Tailwind names).
-    $isStackedOnMobile = $table->isStackedOnMobile();
-    $tableHiddenClass = $table->getStackedTableHiddenClass();
-    $cardsVisibleClass = $table->getStackedCardsVisibleClass();
+    // The frame around the rows — whether it renders yet (lazy), how it keeps
+    // itself current (poll, and the broadcast channel `live(broadcast: true)`
+    // adds), and which optional regions exist at all. All resolved in
+    // ShellRenderPlan, including the three feature guards this block used to
+    // write as `&&` pairs.
+    $isLazy = $plan->shell()->isLazy;
+    $isTableReady = $plan->shell()->isTableReady;
+    $lazyPlaceholder = $plan->shell()->lazyPlaceholder;
+    $pollingConfig = $plan->shell()->pollingConfig;
+    $pollingAttribute = $plan->shell()->pollingAttribute;
+    $liveChannel = $plan->shell()->liveChannel;
+    $filters = $plan->shell()->filters;
+    $hasFilters = $plan->shell()->hasFilters;
+    $isSubRowsExpandable = $plan->shell()->isSubRowsExpandable;
+    $allRowsExpanded = $plan->shell()->allRowsExpanded;
+    // The view menu earns its place from either section it can hold.
+    $hasViewMenu = $plan->shell()->hasViewMenu;
+    $hasSavedViews = $plan->shell()->hasSavedViews;
+    $savedViews = $plan->shell()->savedViews;
+    $viewMenuLabel = $plan->shell()->viewMenuLabel;
 
-    // Check if search/filter is active but no results
-    $hasActiveFilters = !empty($tableSearch) || $activeTableFilters !== [] || $activeColumnFilters !== [];
-    $hasPaginator = $records instanceof LengthAwarePaginator;
-    $recordCount = $hasPaginator ? $records->total() : $records->count();
-    $isEmptyDueToFilter = $hasActiveFilters && $recordCount === 0;
+    // Table state. Which filters count as ACTIVE is a rule with a sharp edge (see
+    // TableQueryState) that used to live here as a recursive closure. The
+    // magic-property hazard this block used to warn about goes with it: the plan
+    // reads the state container, so there is nothing here to reach for.
+    $tableFilters = $plan->state()->filters;
+    $activeTableFilters = $plan->state()->activeFilters;
+    // The mobile sort control names the current column and direction.
+    $sortColumn = $plan->state()->sortColumn;
+    $sortDirection = $plan->state()->sortDirection;
 
-    // Where this page sits in the whole result set. Read by the footer's
-    // "from - to of total" line and, before it, by aria-rowindex: an ARIA row
-    // index counts through the entire grid, not the page, so row 1 of page 2
-    // is not index 1. Hence the lift out of the footer.
-    $rangeFrom = $hasPaginator ? ($records->firstItem() ?? 0) : ($records->count() > 0 ? 1 : 0);
-    $rangeTo = $hasPaginator ? ($records->lastItem() ?? 0) : $records->count();
+    // Floating filter/column-toggle panels present as a bottom sheet on mobile
+    // unless disabled via Table::sheetOnMobile(false) or the global config. The
+    // five class strings all derive from the one breakpoint — LayoutRenderPlan
+    // resolves them together so a partial cannot recompute them differently.
+    $sheetOnMobile = $plan->layout()->sheetOnMobile;
+    $sheetBp = $plan->layout()->sheetBreakpoint;
+    $sheetBpPx = $plan->layout()->sheetBreakpointPx;
+    $sheetPanel = $plan->layout()->sheetPanel;
+    $sheetMotion = $plan->layout()->sheetMotion;
+    $sheetBackdrop = $plan->layout()->sheetBackdrop;
+    $cardsVisibleClass = $plan->layout()->cardsVisibleClass;
 
-    // Header rows come first in the ARIA row numbering, and the column-filter
-    // row is one of them when present — miss it and every body index is off by
-    // one.
-    $headerRowCount = 1 + ($hasColumnFilters ? 1 : 0);
+    // Actions — the two surfaces the toolbar owns (bulk and header), their
+    // collapsed dropdown forms, and the click resolver that keeps wire-core's
+    // action views host-agnostic. Row and mobile-card actions belong to the
+    // region.
+    $bulkActions = $plan->actions()->bulk;
+    $headerActions = $plan->actions()->header;
+    $hasBulkActions = $plan->actions()->hasBulk;
+    $hasHeaderActions = $plan->actions()->hasHeader;
+    $collapseHeaderActions = $plan->actions()->collapseHeader;
+    $mobileHeaderActionGroup = $plan->actions()->mobileHeaderGroup;
+    $headerActionClick = $plan->actions()->headerClick;
 
-    // The body row's opening tag, compiled once for the whole table from
-    // `tables.partials.body-row-open`. Every condition on it is a property of the
-    // TABLE, so the row has one shape; what is per-record arrives through slots.
-    // See the partial for why it is an opening tag and not a whole row.
-    $rowSkeleton = \NyonCode\WireCore\Foundation\View\Skeleton::compile(
-        view('wire-table::tables.partials.body-row-open', [
-            'keyboardNav' => $keyboardNav,
-            'rowClassBinding' => $rowClassBinding,
-            'tableRole' => $tableRole,
-            'isSelectable' => $isSelectable,
-            'rowClass' => \NyonCode\WireCore\Foundation\View\Skeleton::slot('rowClass'),
-            'keyJs' => \NyonCode\WireCore\Foundation\View\Skeleton::slot('keyJs'),
-            'tabindex' => \NyonCode\WireCore\Foundation\View\Skeleton::slot('tabindex'),
-            'rowIndex' => \NyonCode\WireCore\Foundation\View\Skeleton::slot('rowIndex'),
-            'ariaRowIndex' => \NyonCode\WireCore\Foundation\View\Skeleton::slot('ariaRowIndex'),
-            'key' => \NyonCode\WireCore\Foundation\View\Skeleton::slot('key'),
-        ])->render(),
-        'rowClass', 'keyJs', 'tabindex', 'rowIndex', 'ariaRowIndex', 'key',
-    );
+    // The `?` shortcut help. Both look unused below: they reach
+    // partials.shortcut-help-modal through @include scope inheritance.
+    $shortcutLegend = $plan->interaction()->shortcutLegend;
+    $shortcutHelpEvent = $plan->interaction()->shortcutHelpEvent;
 
-    // The selection cell, compiled once for the table — the same move as the <tr>
-    // above, except the markup stays where it belongs, in
-    // `tables.partials.selection-cell`. The Table renders that partial once with a
-    // slot where the record key goes; the row loop fills the key.
-    $selectionCellSkeleton = $isSelectable ? $table->getSelectionCellSkeleton() : null;
+    // Selection lives on the wrapper, not in the region: the Alpine root has to
+    // enclose both renderings of the page (desktop rows and mobile cards) and the
+    // bulk bar above them, and it must survive a targeted render of the region.
+    $isSelectable = $plan->row()->isSelectable;
+    $pageRecordKeys = $plan->row()->pageRecordKeys;
+    $selectionSyncLive = $plan->row()->selectionSyncLive;
+    $selectionAnnouncements = $plan->row()->selectionAnnouncements;
 
-    // Whole sentences for the selection live region: only the server can
-    // translate them, and the counts are substituted client-side because the
-    // selection itself lives in Alpine.
-    $selectionAnnouncements = [
-        'some' => __('wire-table::messages.selection_announce_some', ['count' => ':count', 'total' => ':total']),
-        'all' => __('wire-table::messages.selection_announce_all', ['total' => ':total']),
-        'none' => __('wire-table::messages.selection_announce_none'),
-    ];
+    // What the toolbar's column menu, the mobile sort control and the clipboard
+    // controller each read.
+    $toggleableColumns = $plan->columns()->toggleable;
+    $visibleToggleableCount = $plan->columns()->visibleToggleableCount;
+    $hasColumnToggles = $plan->columns()->hasToggles;
+    $mobileSortableColumns = $plan->columns()->mobileSortable;
+    $hasMobileSort = $plan->columns()->hasMobileSort;
+    $hasCopyableColumn = $plan->columns()->hasCopyable;
+
+    // The size of the whole result set, for the selection strip's "n of N".
+    $recordCount = $plan->paging()->recordCount;
 @endphp
 
 {{-- Lazy loading: trigger load when visible --}}
@@ -360,27 +143,27 @@
 
                         {{-- Table header skeleton --}}
                         <div class="flex gap-4 py-3">
-                            <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded w-1/4"></div>
-                            <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded w-1/4"></div>
-                            <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded w-1/4"></div>
-                            <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded w-1/4"></div>
+                            <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded-sm w-1/4"></div>
+                            <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded-sm w-1/4"></div>
+                            <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded-sm w-1/4"></div>
+                            <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded-sm w-1/4"></div>
                         </div>
 
                         {{-- Row skeletons --}}
                         @for($i = 0; $i < 5; $i++)
                             <div class="flex gap-4 py-4 border-t border-gray-100 dark:border-gray-700/50">
-                                <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded w-1/4"></div>
-                                <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded w-1/4"></div>
-                                <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded w-1/4"></div>
-                                <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded w-1/4"></div>
+                                <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded-sm w-1/4"></div>
+                                <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded-sm w-1/4"></div>
+                                <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded-sm w-1/4"></div>
+                                <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded-sm w-1/4"></div>
                             </div>
                         @endfor
 
                         {{-- Footer skeleton --}}
                         <div
                                 class="flex items-center justify-between pt-4 border-t border-gray-200 dark:border-gray-700">
-                            <div class="h-8 bg-gray-200 dark:bg-gray-700 rounded w-32"></div>
-                            <div class="h-8 bg-gray-200 dark:bg-gray-700 rounded w-48"></div>
+                            <div class="h-8 bg-gray-200 dark:bg-gray-700 rounded-sm w-32"></div>
+                            <div class="h-8 bg-gray-200 dark:bg-gray-700 rounded-sm w-48"></div>
                         </div>
                     </div>
 
@@ -442,7 +225,7 @@
                             class="sr-only"
                             aria-live="polite"
                             aria-atomic="true"
-                            data-testid="selection-live"
+                            data-testid="selection-live" @wireEl('selection-live')
                             x-text="announcement"
                     ></div>
 
@@ -453,10 +236,30 @@
                         @include('wire-table::tables.partials.selection-assets')
                     @endonce
                 @endif
-                <div class="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700">
+                {{-- `overflow-clip`, because the radius on this element is a promise
+                     nothing inside it keeps on its own. A selected last row paints a
+                     rectangle to the card's bottom edge and squares off the corner the
+                     border is still curving around; the scroll-edge gradients do the
+                     same at all four; a stripe, a hover tint and a row colour do it
+                     the moment the row is the last one. Every one of those is a
+                     background on a `<tr>` or on a full-height overlay, and neither
+                     can be given a corner of its own — a `<tr>` has no border-box to
+                     round, and an overlay does not know which of its ends is at the
+                     card's edge.
+
+                     Clip and not `overflow-hidden`: hidden makes this a scroll
+                     container, and the nearest scroll container is what a
+                     `position: sticky` descendant sticks inside. The pinned header
+                     and the pinned actions column are safe either way — their
+                     scroller is nearer — but the stacked cards' group headings
+                     (`sticky top-0` in the data region) stick against the VIEWPORT,
+                     and a scroll container here would silently leave them in flow on
+                     a phone. `overflow: clip` clips without becoming one, so nothing
+                     above it in the sticky chain changes. --}}
+                <div class="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 overflow-clip">
 
                     {{-- Header --}}
-                    <div class="px-4 lg:px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+                    <div class="px-4 lg:px-6 py-4 border-b border-gray-200 dark:border-gray-700" @wireEl('table-toolbar')>
                         <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
                             {{-- Left side: Search & Filters --}}
                             <div class="flex flex-1 items-center gap-3">
@@ -472,11 +275,13 @@
                                                 wire:model.live.debounce.300ms="tableState.search"
                                                 placeholder="{{ __('wire-table::messages.search') }}..."
                                                 aria-label="{{ __('wire-table::messages.search') }}"
-                                                data-testid="table-search"
+                                                data-testid="table-search" @wireEl('table-search')
                                                 class="block w-full rounded-lg border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50 pl-9 pr-3 py-2 text-sm placeholder-gray-400 focus:border-primary-500 focus:ring-primary-500 dark:text-white dark:placeholder-gray-500"
                                         >
                                     </div>
                                 @endif
+
+                                @wireRenderHook('table.toolbar.end')
 
                                 {{-- Filters Toggle --}}
                                 @if($hasFilters)
@@ -487,7 +292,7 @@
                                                 x-ref="trigger"
                                                 @click="toggle()"
                                                 type="button"
-                                                data-testid="table-filters-trigger"
+                                                data-testid="table-filters-trigger" @wireEl('table-filters-trigger')
                                                 aria-label="{{ __('wire-table::messages.filters') }}"
                                                 class="inline-flex items-center gap-2 rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm font-medium text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-primary-500"
                                         >
@@ -609,7 +414,7 @@
                                             @include('wire-table::tables.partials.header-actions', ['headerActions' => $headerActions])
                                         </div>
 
-                                        <div class="{{ $table->getMobileHeaderActionsVisibleClass() }}" data-testid="table-header-actions-mobile">
+                                        <div class="{{ $table->getMobileHeaderActionsVisibleClass() }}" data-testid="table-header-actions-mobile" @wireEl('table-header-actions-mobile')>
                                             {!! $mobileHeaderActionGroup->render(null, $headerActionClick) !!}
                                         </div>
                                     @else
@@ -636,7 +441,7 @@
                                                 class="inline-flex items-center justify-center rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 p-2 text-gray-500 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-primary-500"
                                                 title="{{ $viewMenuLabel }}"
                                                 aria-label="{{ $viewMenuLabel }}"
-                                                data-testid="table-column-toggle"
+                                                data-testid="table-column-toggle" @wireEl('table-column-toggle')
                                         >
                                             {!! icon('outline:view-columns', 'h-5 w-5') !!}
                                         </button>
@@ -683,9 +488,57 @@
                                                     @include('wire-core::partials.sheet-grabber', ['dismiss' => 'close()', 'breakpoint' => $sheetBp])
                                                 @endif
                                                 <div class="p-2">
+                                                {{-- Saved views. First in the menu because switching view is
+                                                     the coarsest thing here: it replaces the sort, the search,
+                                                     the filters and the columns in one go, so reading the
+                                                     column checkboxes below it before choosing a view would be
+                                                     reading a layout that is about to be replaced. --}}
+                                                @if($hasSavedViews)
+                                                    <div class="px-3 py-2 text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider border-b border-gray-100 dark:border-gray-700 mb-1">
+                                                        {{ __('wire-table::messages.views_section') }}
+                                                    </div>
+                                                    @foreach($savedViews as $savedView)
+                                                        <div class="flex items-center gap-1 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700/50">
+                                                            <button
+                                                                    type="button"
+                                                                    wire:click="applyTableView(@js($savedView))"
+                                                                    wire:loading.attr="disabled"
+                                                                    wire:target="applyTableView(@js($savedView))"
+                                                                    data-testid="table-view-{{ $savedView }}"
+                                                                    class="flex-1 min-w-0 truncate px-3 py-2 text-left text-sm text-gray-700 dark:text-gray-300"
+                                                            >{{ $savedView }}</button>
+                                                            <button
+                                                                    type="button"
+                                                                    wire:click="deleteTableView(@js($savedView))"
+                                                                    wire:loading.attr="disabled"
+                                                                    wire:target="deleteTableView(@js($savedView))"
+                                                                    data-testid="table-view-delete-{{ $savedView }}"
+                                                                    title="{{ __('wire-table::messages.delete_view') }}"
+                                                                    aria-label="{{ __('wire-table::messages.delete_view') }}"
+                                                                    class="shrink-0 rounded-md p-1.5 mr-1 text-gray-400 hover:text-red-600 dark:hover:text-red-400"
+                                                            >{!! icon('outline:trash', 'h-4 w-4') !!}</button>
+                                                        </div>
+                                                    @endforeach
+                                                    {{-- The name is asked for in the browser rather than with a
+                                                         field in this panel: the panel is teleported to <body>
+                                                         and closes on click-outside, so an input in it would
+                                                         lose what was typed to the first stray click. --}}
+                                                    <button
+                                                            type="button"
+                                                            x-on:click="$wire.saveTableView(window.prompt(@js(__('wire-table::messages.save_view_prompt'))) ?? '')"
+                                                            data-testid="table-view-save" @wireEl('table-view-save')
+                                                            @class([
+                                                                'mt-1 flex w-full items-center gap-3 px-3 py-2 text-left text-sm text-gray-500 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700/50 rounded-lg',
+                                                                'border-t border-gray-100 dark:border-gray-700' => $savedViews !== [],
+                                                            ])
+                                                    >
+                                                        {!! icon('outline:bookmark', 'h-4 w-4') !!}
+                                                        {{ __('wire-table::messages.save_current_view') }}
+                                                    </button>
+                                                @endif
                                                 @if($hasColumnToggles)
                                                 <div
-                                                        class="px-3 py-2 text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider border-b border-gray-100 dark:border-gray-700 mb-1">
+                                                        class="px-3 py-2 text-xs font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider border-b border-gray-100 dark:border-gray-700 mb-1 {{ $hasSavedViews ? 'border-t mt-1' : '' }}">
                                                     {{ __('wire-table::messages.columns_section') }}
                                                 </div>
                                                 @endif
@@ -704,7 +557,7 @@
                                                                     @endif
                                                                     @checked($isVisible)
                                                                     @disabled($isLastVisible)
-                                                                    class="h-4 w-4 rounded border-gray-300 dark:border-gray-600 text-primary-600 focus:ring-primary-500 dark:bg-gray-700 {{ $isLastVisible ? 'cursor-not-allowed' : 'cursor-pointer' }}"
+                                                                    class="h-4 w-4 rounded-sm border-gray-300 dark:border-gray-600 text-primary-600 focus:ring-primary-500 dark:bg-gray-700 {{ $isLastVisible ? 'cursor-not-allowed' : 'cursor-pointer' }}"
                                                             >
                                                         </div>
                                                         <span
@@ -725,8 +578,8 @@
                                                                     type="checkbox"
                                                                     wire:click="toggleAllRowExpansion"
                                                                     @checked($allRowsExpanded)
-                                                                    data-testid="subrows-expand-all-rows"
-                                                                    class="h-4 w-4 rounded border-gray-300 dark:border-gray-600 text-primary-600 focus:ring-primary-500 dark:bg-gray-700 cursor-pointer"
+                                                                    data-testid="subrows-expand-all-rows" @wireEl('subrows-expand-all-rows')
+                                                                    class="h-4 w-4 rounded-sm border-gray-300 dark:border-gray-600 text-primary-600 focus:ring-primary-500 dark:bg-gray-700 cursor-pointer"
                                                             >
                                                         </div>
                                                         <span class="text-sm text-gray-700 dark:text-gray-300">
@@ -766,7 +619,7 @@
                         <div
                                 x-show="selectedCount > 0"
                                 x-cloak
-                                data-testid="table-bulk-bar"
+                                data-testid="table-bulk-bar" @wireEl('table-bulk-bar')
                                 class="px-4 lg:px-6 py-3 bg-primary-50 dark:bg-primary-900/20 border-b border-primary-100 dark:border-primary-800/30">
                             {{-- Stacks on mobile so multiple bulk-action buttons wrap instead of overflowing. --}}
                             <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -798,7 +651,7 @@
                                     <button
                                             type="button"
                                             x-on:click="deselectAll()"
-                                            data-testid="table-deselect"
+                                            data-testid="table-deselect" @wireEl('table-deselect')
                                             aria-label="{{ __('wire-table::messages.deselect') }}"
                                             class="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-primary-700 dark:text-primary-300 hover:text-primary-800 dark:hover:text-primary-200 hover:bg-primary-100 dark:hover:bg-primary-800/50 rounded-lg transition-colors"
                                     >
@@ -813,7 +666,7 @@
                                  never a surprise the user has to discover. --}}
                             @if($recordCount > count($pageRecordKeys))
                                 <div class="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-primary-700 dark:text-primary-300"
-                                     data-testid="table-selection-scope">
+                                     data-testid="table-selection-scope" @wireEl('table-selection-scope')>
                                     <template x-if="selectsAll">
                                         <span>{{ __('wire-table::messages.selection_all_matching', ['count' => $recordCount]) }}</span>
                                     </template>
@@ -825,7 +678,7 @@
                                             type="button"
                                             x-show="!selectsAll"
                                             x-on:click="selectAllMatching()"
-                                            data-testid="table-select-all-matching"
+                                            data-testid="table-select-all-matching" @wireEl('table-select-all-matching')
                                             class="font-semibold underline underline-offset-2 hover:no-underline"
                                     >
                                         {{ __('wire-table::messages.selection_select_all_matching', ['count' => $recordCount]) }}
@@ -835,7 +688,7 @@
                                             x-show="selectsAll"
                                             x-cloak
                                             x-on:click="selectOnlyPage()"
-                                            data-testid="table-select-only-page"
+                                            data-testid="table-select-only-page" @wireEl('table-select-only-page')
                                             class="font-semibold underline underline-offset-2 hover:no-underline"
                                     >
                                         {{ __('wire-table::messages.selection_only_this_page') }}
@@ -845,673 +698,54 @@
                         </div>
                     @endif
 
-                    {{-- Table --}}
-                    {{-- `relative` is the positioning context the fill handle and its
-                         range overlay are placed against, so they scroll with the table. --}}
-                    <div class="relative overflow-x-auto {{ $tableHiddenClass }}"
-                         @if($isFillEnabled)
-                             x-data="wireFillHandle()"
-                             data-fill-root
-                             data-fill-columns="{{ json_encode($fillColumns) }}"
-                             data-fill-max="{{ $table->getFillMaxRecords() }}"
-                         @endif
-                    >
-                        @if($hasVisibleColumns)
-                            <table
-                                    @if($tableRole)
-                                        role="{{ $tableRole }}"
-                                        {{-- Counts the whole result set plus the header rows, not
-                                             the page: a grid tells assistive tech how much there is
-                                             to page through, and the row indices below match it. --}}
-                                        aria-rowcount="{{ $recordCount + $headerRowCount }}"
-                                        @if($isSelectable) aria-multiselectable="true" @endif
-                                    @endif
-                                    class="w-full {{ $isBordered ? 'border-collapse' : '' }} {{ $table->getTableClass() }}">
-                                <thead
-                                        class="bg-gray-50 dark:bg-gray-800/50 text-xs text-gray-500 dark:text-gray-400 uppercase {{ $table->getHeaderClass() }}">
-                                <tr @if($tableRole) aria-rowindex="1" @endif>
-                                    {{-- Select All Checkbox --}}
-                                    @if($isSelectable)
-                                        <th scope="col" class="w-12 {{ $headerPadding }}">
-                                            <div class="flex items-center justify-center">
-                                                <button
-                                                        type="button"
-                                                        x-on:click="toggleAll()"
-                                                        role="checkbox"
-                                                        :aria-checked="allSelected ? 'true' : (someSelected ? 'mixed' : 'false')"
-                                                        aria-label="{{ __('wire-table::messages.select_all') }}"
-                                                        data-testid="table-select-all"
-                                                        class="relative h-4 w-4 rounded border focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 dark:focus:ring-offset-gray-800 transition-colors"
-                                                        :class="(allSelected || someSelected) ? 'bg-primary-600 border-primary-600' : 'bg-white dark:bg-gray-700 border-gray-300 dark:border-gray-600'"
-                                                >
-                                                    <span x-show="allSelected" x-cloak>
-                                                        {!! icon('check', 'h-4 w-4', 'absolute inset-0 text-white') !!}
-                                                    </span>
-                                                    <span x-show="someSelected" x-cloak>
-                                                        {!! icon('minus', 'h-4 w-4', 'absolute inset-0 text-white') !!}
-                                                    </span>
-                                                </button>
-                                            </div>
-                                        </th>
-                                    @endif
+                    {{-- The table, the stacked cards and the pagination footer.
 
-                                    {{-- Sub-row Toggle Header: master expand/collapse, directly
-                                         above the row chevrons it drives. --}}
-                                    @if($hasSubRows)
-                                        <th scope="col" class="w-10 {{ $headerPadding }}">
-                                            @if($isSubRowsExpandable)
-                                                @include('wire-table::tables.partials.sub-rows-master-toggle', [
-                                                    'allRowsExpanded' => $allRowsExpanded,
-                                                    'label' => $table->getSubRowsToggleLabel(),
-                                                ])
-                                            @else
-                                                {{ $table->getSubRowsToggleLabel() ?? '' }}
-                                            @endif
-                                        </th>
-                                    @endif
+                         An island, so a row change costs the rows instead of the
+                         page. Anything that fires an action from inside these
+                         markers targets it automatically — Livewire's JS walks up
+                         to the nearest island fragment, no attribute needed — so a
+                         sort, a page, a cell save, a sub-row expansion or a row
+                         action renders THIS ALONE and leaves the toolbar, the
+                         filter panels and the modals untouched and un-morphed.
 
-                                    {{-- Actions Header (Start Position) --}}
-                                    @if($hasActions && $actionsPosition === 'start')
-                                        <th
-                                                scope="col"
-                                                class="{{ $headerPadding }} font-semibold {{ $actionsAlignmentClass }}"
-                                                @if($actionsColumnWidth) style="width: {{ $actionsColumnWidth }}" @endif
-                                        >
-                                            {{ $actionsColumnLabel }}
-                                        </th>
-                                    @endif
+                         `always` matters for the other direction: a request that
+                         does not target the island — a search, a filter, a column
+                         toggle, a poll tick — must still re-render it, or the rows
+                         behind it go stale. With it, every untargeted path behaves
+                         exactly as before.
 
-                                    {{-- Column Headers --}}
-                                    @foreach($visibleColumns as $column)
-                                        @php $hm = $columnMeta[$column->getName()]; @endphp
-                                        <th
-                                                scope="col"
-                                                data-column="{{ $column->getName() }}"
-                                                class="{{ $headerPadding }} {{ $hm['alignment'] }} font-semibold {{ $isBordered ? 'border border-gray-200 dark:border-gray-700' : '' }} {{ $hm['responsive'] }}"
-                                                @if($column->getWidth()) style="width: {{ $column->getWidth() }}" @endif
-                                                @if($hm['extraHeader']) {!! $hm['extraHeader'] !!} @endif
-                                        >
-                                            @if($column->isSortable() && $table->isSortable())
-                                                <button
-                                                        type="button"
-                                                        wire:click="sortTable('{{ $column->getName() }}')"
-                                                        data-testid="table-sort-{{ $column->getName() }}"
-                                                        class="group inline-flex items-center gap-1 hover:text-gray-700 dark:hover:text-gray-200"
-                                                >
-                                                    <span>{{ $column->getLabel() }}</span>
-                                                    <span class="flex-none">
-                                                @if($sortColumn === $column->getName())
-                                                            @if($sortDirection === 'asc')
-                                                                {!! icon('outline:chevron-up', 'h-4 w-4', 'text-gray-500 dark:text-gray-400') !!}
-                                                            @else
-                                                                {!! icon('outline:chevron-down', 'h-4 w-4', 'text-gray-500 dark:text-gray-400') !!}
-                                                            @endif
-                                                        @else
-                                                            {!! icon('outline:chevron-up-down', 'h-4 w-4', 'text-gray-500 dark:text-gray-400 opacity-0 group-hover:opacity-100') !!}
-                                                        @endif
-                                            </span>
-                                                </button>
-                                            @else
-                                                {{ $column->getLabel() }}
-                                            @endif
-                                        </th>
-                                    @endforeach
-
-                                    {{-- Actions Header (End Position - Default) --}}
-                                    @if($hasActions && $actionsPosition === 'end')
-                                        <th
-                                                scope="col"
-                                                class="{{ $headerPadding }} font-semibold {{ $actionsAlignmentClass }}"
-                                                @if($actionsColumnWidth) style="width: {{ $actionsColumnWidth }}" @endif
-                                        >
-                                            {{ $actionsColumnLabel }}
-                                        </th>
-                                    @endif
-                                </tr>
-
-                                {{-- Row Filters --}}
-                                @if($hasColumnFilters)
-                                    <tr @if($tableRole) aria-rowindex="2" @endif
-                                        class="bg-gray-50/50 dark:bg-gray-800/30 border-t border-gray-100 dark:border-gray-700/50">
-                                        @if($isSelectable)
-                                            <th class="{{ $headerPadding }}"></th>
-                                        @endif
-
-                                        {{-- Sub-row Toggle Filter Cell --}}
-                                        @if($hasSubRows)
-                                            <th class="{{ $headerPadding }}"></th>
-                                        @endif
-
-                                        {{-- Actions Filter Cell (Start Position) --}}
-                                        @if($hasActions && $actionsPosition === 'start')
-                                            <th class="{{ $headerPadding }}"></th>
-                                        @endif
-
-                                        @foreach($visibleColumns as $column)
-                                            <th class="{{ $headerPadding }}" @if($column->isFilterable()) data-testid="table-filter-{{ $column->getName() }}" @endif>
-                                                @if($column->isFilterable())
-                                                    {!! $column->renderFilter($columnFilterValues[$column->getName()] ?? null) !!}
-                                                @endif
-                                            </th>
-                                        @endforeach
-
-                                        {{-- Actions Filter Cell (End Position) --}}
-                                        @if($hasActions && $actionsPosition === 'end')
-                                            <th class="{{ $headerPadding }} text-right">
-                                                @if($activeColumnFilters !== [])
-                                                    <button
-                                                            type="button"
-                                                            wire:click="resetColumnFilters"
-                                                            class="inline-flex items-center justify-center p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 rounded hover:bg-gray-100 dark:hover:bg-gray-700"
-                                                            title="{{ __('wire-table::messages.filter_reset_column') }}"
-                                                    >
-                                                        {!! icon('outline:x-mark', 'w-4 h-4') !!}
-                                                    </button>
-                                                @endif
-                                            </th>
-                                        @endif
-                                    </tr>
-                                @endif
-                                </thead>
-
-                                <tbody
-                                        class="divide-y divide-gray-100 dark:divide-gray-700"
-                                        @if($recordActionsRootEnabled)
-                                            x-data="wireRecordActions({ bindings: @js($recordActionBindings), contextMenu: {{ $rowContextMenuEnabled ? 'true' : 'false' }}, keyboard: @js($recordKeyboardConfig), active: @js($activeRowConfig), gestures: @js($gestureConfig) })"
-                                            {{-- Bound whenever the controller is mounted, not only for pointer
-                                                 bindings: a click also moves the active row, which is what makes a
-                                                 clicked row visibly the one the arrow keys continue from. --}}
-                                            @click="onPointer('click', $event)"
-                                            @dblclick="onPointer('dblclick', $event)"
-                                            @if($rowContextMenuEnabled)
-                                                @contextmenu="onContextMenu($event)"
-                                            @endif
-                                            @if($keyboardNav)
-                                                @keydown="onKeydown($event)"
-                                                @focusin="onRowFocus($event)"
-                                            @endif
-                                        @endif
-                                >
-                                @if($recordActionsRootEnabled)
-                                    @once
-                                        @include('wire-table::tables.partials.record-actions-assets')
-                                    @endonce
-                                @endif
-                                @if($rowContextMenuEnabled)
-                                    {{-- Core dropdown bundle for any nested action-group dropdown inside a
-                                         context-menu item; emitted once per request, not once per row. --}}
-                                    @once
-                                        @include('wire-core::partials.floating-assets')
-                                    @endonce
-                                @endif
-                                @forelse($records as $record)
-                                    @php
-                                        $recordKey = $record->{$table->getPrimaryKey()};
-                                        $recordUrl = $table->getRecordUrl($record);
-                                        $rowIndex = $loop->index;
-
-                                        $groupValue = $hasGrouping ? $table->getGroupComparisonKey($record) : null;
-                                        $prevRecord = $hasGrouping && $rowIndex > 0 ? $records[$rowIndex - 1] : null;
-                                        $nextRecord = $hasGrouping ? ($records[$rowIndex + 1] ?? null) : null;
-                                        $isGroupStart = $hasGrouping && ($prevRecord === null || $table->getGroupComparisonKey($prevRecord) !== $groupValue);
-                                        $isGroupEnd = $hasGrouping && ($nextRecord === null || $table->getGroupComparisonKey($nextRecord) !== $groupValue);
-
-                                        // Right-click context menu. The Table owns both halves: the
-                                        // panel's shape (a skeleton compiled once for the table) and
-                                        // the decision that a row with no visible action gets none.
-                                        //
-                                        // The `@if` at the emit site therefore looks redundant — the
-                                        // string is already empty — and it is NOT. It emits a pair of
-                                        // Livewire morph markers around the <template>, and those are
-                                        // load-bearing: the row's children CAN change between renders
-                                        // (a column reorder rewrites the cell list), and morphdom needs
-                                        // that block boundary to pair them up. Removing the `@if` to
-                                        // save two comment nodes per row breaks the reorder — the
-                                        // header reorders, the body does not. Both fuses stayed green
-                                        // through that; only verify-gesture-lab.mjs caught it
-                                        // ("dragging a column header moves that column, in the header
-                                        // and the body alike").
-                                        $rowContextMenuPanel = $table->getRowContextMenuPanel($record);
-
-                                        // Per-record sub-rows (subRowsVisible): decides this row's
-                                        // chevron and panel only — the expander cell itself still
-                                        // renders, empty, or the columns stop lining up.
-                                        $recordHasSubRows = $hasSubRows && $table->hasSubRowsFor($record);
-                                    @endphp
-
-                                    {{-- Group header. Compiled once for the table; this group
-                                         supplies its label. --}}
-                                    @if($isGroupStart){!! $table->getGroupHeaderRow($record, $colSpan) !!}@endif
-                                    @php
-                                        $recordKeyJs = \Illuminate\Support\Js::from((string) $recordKey)->toHtml();
-                                        // Values only — the shape was settled once, above.
-                                        $rowOpen = $rowSkeleton->fill([
-                                            'rowClass' => e($table->getRowClasses($record, $rowIndex)),
-                                            'keyJs' => $recordKeyJs,
-                                            'tabindex' => $rowIndex === 0 ? '0' : '-1',
-                                            'rowIndex' => (string) $rowIndex,
-                                            'ariaRowIndex' => (string) ($headerRowCount + $rangeFrom + $rowIndex),
-                                            'key' => e((string) $recordKey),
-                                        ]);
-                                    @endphp
-                                    {!! $rowOpen !!}
-                                        @if($rowContextMenuPanel !== ''){!! $rowContextMenuPanel !!}@endif
-                                        {{-- Selection cell. The shape was settled once, in the
-                                             preamble; this row supplies the key. --}}
-                                        @if($isSelectable){!! $selectionCellSkeleton->fill(['keyJs' => $recordKeyJs]) !!}@endif
-
-                                        {{-- Sub-row expander cell. Three shapes, each compiled once
-                                             for the table; this row picks one and supplies its key.
-                                             The `@if` the partial keeps inside itself is what puts
-                                             this row's morph markers back — see the partial. --}}
-                                        @if($hasSubRows){!! $table->getSubRowCell(
-                                            $recordKeyJs,
-                                            $isSubRowsExpandable && $recordHasSubRows,
-                                            $component->isRowExpanded($recordKey),
-                                        ) !!}@endif
-
-                                        {{-- Actions Cell (Start Position) --}}
-                                        @if($hasActions && $actionsPosition === 'start')
-                                            {{-- Tags touch, and the @foreach stays. The whitespace between
-                                                 them was four DOM text nodes per row for markup that never
-                                                 varies; the loop's morph markers are NOT surplus, because
-                                                 the button list genuinely changes per record (an action can
-                                                 be non-executable for one row and not the next) — the case
-                                                 §8f showed those markers exist for. --}}
-                                            <td class="{{ $cellPadding }} {{ $isBordered ? 'border border-gray-200 dark:border-gray-700' : '' }}"><div class="flex flex-wrap items-center gap-1 {{ $actionsJustifyClass }}">@foreach($actions as $action){!! $action->render($record, $actionClick) !!}@endforeach</div></td>
-                                        @endif
-
-                                        {{-- Column Cells. Assembled in PHP rather than by a @foreach, so
-                                             the row emits no whitespace between the cells and Blade runs
-                                             no per-cell conditional — the two things that made a <td>
-                                             cost ~900 bytes and a fistful of DOM nodes to say `v`. The
-                                             cell is $cm['cell'], compiled once per column above. --}}
-                                        @php
-                                            $cellsHtml = '';
-                                            $linkOpen = $recordUrl
-                                                ? '<a href="'.e($recordUrl).'" class="hover:text-primary-600 dark:hover:text-primary-400">'
-                                                : '';
-
-                                            foreach ($visibleColumns as $column) {
-                                                $cm = $columnMeta[$column->getName()];
-                                                $cell = $cm['responsiveDisplay']
-                                                    ? $column->renderResponsiveCell($record)
-                                                    : $column->renderCellFast($record);
-
-                                                // A record url turns every non-editable cell into a link to
-                                                // the record; an editable one keeps its own interaction.
-                                                if ($linkOpen !== '' && ! $cm['editable']) {
-                                                    $cell = $linkOpen.$cell.'</a>';
-                                                }
-
-                                                $cellsHtml .= $cm['cell']->fill(['content' => $cell]);
-                                            }
-                                        @endphp
-                                        {!! $cellsHtml !!}
-
-                                        {{-- Actions Cell (End Position - Default) --}}
-                                        @if($hasActions && $actionsPosition === 'end')
-                                            {{-- Tags touch, and the @foreach stays. The whitespace between
-                                                 them was four DOM text nodes per row for markup that never
-                                                 varies; the loop's morph markers are NOT surplus, because
-                                                 the button list genuinely changes per record (an action can
-                                                 be non-executable for one row and not the next) — the case
-                                                 §8f showed those markers exist for. --}}
-                                            <td class="{{ $cellPadding }} {{ $isBordered ? 'border border-gray-200 dark:border-gray-700' : '' }}"><div class="flex flex-wrap items-center gap-1 {{ $actionsJustifyClass }}">@foreach($actions as $action){!! $action->render($record, $actionClick) !!}@endforeach</div></td>
-                                        @endif
-                                    </tr>
-
-                                    {{-- Sub-rows --}}
-                                    @if($recordHasSubRows && $component->isRowExpanded($recordKey))
-                                        @php
-                                            $subRows = $component->getSubRows($record);
-                                        @endphp
-                                        @include('wire-table::tables.partials.sub-rows', [
-                                            'table' => $table,
-                                            'component' => $component,
-                                            'record' => $record,
-                                            'recordKey' => $recordKey,
-                                            'subRows' => $subRows,
-                                            'visibleSubRowColumns' => $visibleSubRowColumns,
-                                            'colSpan' => $colSpan,
-                                            'cellPadding' => $cellPadding,
-                                            'isBordered' => $isBordered,
-                                        ])
-                                    @endif
-
-                                    {{-- Group subtotal --}}
-                                    @if($isGroupEnd && $hasGroupSummaries)
-                                        @include('wire-table::tables.partials.group-subtotal', [
-                                            'table' => $table,
-                                            'component' => $component,
-                                            'groupSummaries' => $component->computeGroupSummaries($groupValue),
-                                            'visibleColumns' => $visibleColumns,
-                                            'colSpan' => $colSpan,
-                                            'cellPadding' => $cellPadding,
-                                            'isBordered' => $isBordered,
-                                            'isSelectable' => $isSelectable,
-                                            'hasActions' => $hasActions,
-                                            'actionsPosition' => $actionsPosition,
-                                        ])
-                                    @endif
-                                @empty
-                                    <tr>
-                                        <td colspan="{{ $colSpan }}" class="px-6 py-16 text-center">
-                                            {{-- Canonical empty-state surface; filter-empty adds a reset action. --}}
-                                            @include('wire-core::partials.empty-state', [
-                                                'icon' => $isEmptyDueToFilter
-                                                    ? 'outline:magnifying-glass'
-                                                    : ($table->getEmptyStateIcon() ?? 'outline:inbox'),
-                                                'heading' => $isEmptyDueToFilter
-                                                    ? __('wire-table::messages.empty_filter_heading')
-                                                    : $table->getEmptyStateHeading(),
-                                                'description' => $isEmptyDueToFilter
-                                                    ? __('wire-table::messages.empty_no_records_match')
-                                                    : $table->getEmptyStateDescription(),
-                                                'actions' => $isEmptyDueToFilter
-                                                    ? [view('wire-table::tables.partials.reset-filters-button')->render()]
-                                                    : $table->getEmptyStateActionsHtml(),
-                                            ])
-                                        </td>
-                                    </tr>
-                                @endforelse
-                                </tbody>
-
-                                {{-- Summary footer --}}
-                                @if($hasSummaries)
-                                    @php $summaryScope = $component->getSummaryScope(); @endphp
-                                    @include('wire-table::tables.partials.summary-footer', [
-                                        'table' => $table,
-                                        'component' => $component,
-                                        'summaries' => $component->computeTableSummaries($summaryScope),
-                                        'subRowGrandTotals' => $component->computeSubRowGrandTotals($summaryScope),
-                                        'summaryScope' => $summaryScope,
-                                        'summaryScopeOptions' => $component->getSummaryScopeOptions(),
-                                        'isSelectable' => $isSelectable,
-                                        'hasActions' => $hasActions,
-                                        'actionsPosition' => $actionsPosition,
-                                        'cellPadding' => $cellPadding,
-                                        'isBordered' => $isBordered,
-                                        'visibleColumns' => $visibleColumns,
-                                        'colSpan' => $colSpan,
-                                    ])
-                                @endif
-                            </table>
-
-                            @if($isFillEnabled)
-                                @include('wire-table::tables.partials.fill-handle', [
-                                    'fillColumns' => $fillColumns,
-                                    'fillMax' => $table->getFillMaxRecords(),
-                                ])
-                            @endif
-                        @else
-                            {{-- No columns visible state --}}
-                            <div class="px-6 py-16 text-center">
-                                <div class="flex flex-col items-center gap-3">
-                                    <div class="rounded-full bg-amber-100 dark:bg-amber-900/30 p-3">
-                                        {!! icon('outline:eye-slash', 'h-8 w-8', 'text-amber-500 dark:text-amber-400') !!}
-                                    </div>
-                                    <div>
-                                        <h3 class="text-base font-medium text-gray-900 dark:text-white">
-                                            {{ __('wire-table::messages.empty_no_columns') }}
-                                        </h3>
-                                        <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
-                                            {{ __('wire-table::messages.empty_no_columns_hint') }}
-                                        </p>
-                                    </div>
-                                </div>
-                            </div>
-                        @endif
-                    </div>
-
-                    {{-- Mobile Cards (Stacked Layout) --}}
-                    @if($isStackedOnMobile && $hasVisibleColumns)
-                        <div class="{{ $cardsVisibleClass }}">
-                            {{-- The card view's select-all. It has to live here because the
-                                 header row that carries it on desktop is hidden at this
-                                 width — without it, selecting a page on a phone means
-                                 tapping every card. Always rendered, never behind a
-                                 gesture: what is not visible is not found. --}}
-                            @if($isSelectable)
-                                <div class="flex items-center gap-3 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/40 px-4 py-2.5">
-                                    <button
-                                            type="button"
-                                            x-on:click="toggleAll()"
-                                            role="checkbox"
-                                            :aria-checked="allSelected ? 'true' : (someSelected ? 'mixed' : 'false')"
-                                            aria-label="{{ __('wire-table::messages.select_all_on_page') }}"
-                                            data-testid="table-card-select-all"
-                                            class="relative h-5 w-5 shrink-0 rounded border transition-colors focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 dark:focus:ring-offset-gray-800"
-                                            :class="(allSelected || someSelected) ? 'bg-primary-600 border-primary-600' : 'bg-white dark:bg-gray-700 border-gray-300 dark:border-gray-600'"
-                                    >
-                                        <span x-show="allSelected" x-cloak>{!! $selectCheckIcon !!}</span>
-                                        <span x-show="someSelected" x-cloak>
-                                            {!! icon('minus', 'h-4 w-4', 'absolute inset-0 text-white') !!}
-                                        </span>
-                                    </button>
-                                    <span class="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">
-                                        {{ __('wire-table::messages.select_all') }}
-                                    </span>
-                                    <span class="ml-auto text-xs tabular-nums text-gray-500 dark:text-gray-400"
-                                          data-testid="table-card-select-count">
-                                        <span x-show="selectedCount === 0">{{ __('wire-table::messages.selection_page_of_total', ['page' => count($pageRecordKeys), 'total' => $recordCount]) }}</span>
-                                        <span x-show="selectedCount > 0" x-cloak
-                                              x-text="@js(__('wire-table::messages.selection_selected_of_total', ['count' => ':count', 'total' => $recordCount])).replace(':count', selectedCount)"></span>
-                                    </span>
-                                </div>
-                            @endif
-
-                            @php
-                                // A card is a record, not the column order in disguise: the
-                                // slots below carry the hierarchy (what it is, whose it is,
-                                // how much), and MobileCard derives them when nothing says.
-                                $card = $table->getMobileCard(array_values($visibleColumns));
-                                $cardTitle = $card->title();
-                                $cardSubtitle = $card->subtitle();
-                                $cardMetric = $card->metric();
-                                $cardMeta = $card->meta();
-                                $cardDetails = $card->details();
-                                $mobileCell = fn($column, $record) => $column->hasResponsiveDisplay()
-                                    ? $column->renderMobileCell($record)
-                                    : $column->renderCellFast($record);
-                            @endphp
-                            {{-- Record actions are a desktop pointer affordance: the delegated
-                                 controller lives on the desktop <tbody> only, so click/dblclick/
-                                 right-click record actions do not apply to these touch cards. The
-                                 same actions reach a finger as ordinary buttons instead — see
-                                 $mobileActions, which folds the behaviour-only bindings in. --}}
-                            {{-- Mind the whitespace below: the tags touch on purpose.
-
-                                 This is a SECOND full rendering of every record — the desktop
-                                 rows are in the same document, hidden by CSS at this width — so
-                                 the card's layout is emitted per row and every run of whitespace
-                                 between two tags is one more DOM text node the morph walks on
-                                 every commit. Measured before this was closed up: 4391 B and 36
-                                 whitespace nodes per row, 225% on top of the row itself.
-
-                                 Whitespace BETWEEN ATTRIBUTES is free (no node), so the
-                                 attributes stay laid out, and every conditional stays exactly
-                                 where it was — the morph markers an @if emits are load-bearing
-                                 (see §8f in architecture/plans/render-engine-htmlable-first.md).
-                                 Mind also that a directive must never be glued straight onto a
-                                 Blade comment: Livewire then fails to inject its opening marker.
-                            --}}
-                            @forelse($records as $record)
-                                @php
-                                    $recordKey = $record->{$table->getPrimaryKey()};
-                                    $recordUrl = $table->getRecordUrl($record);
-                                @endphp
-                                <div
-                                        class="{{ $table->getRowCardClasses($record) }}"
-                                        data-testid="table-card"
-                                        data-row-key="{{ $recordKey }}"
-                                        @if($isSelectable) :class="isSelected(@js((string) $recordKey)) ? 'ring-2 ring-primary-500 ring-inset bg-primary-50/50 dark:bg-primary-900/30' : ''" @endif
-                                >{{-- Header: identifier on the left, the figure the list is read
-                                    for on the right, actions after it. --}}<div
-                                        class="flex items-start gap-3 px-4 pt-4 {{ count($cardDetails) > 0 ? 'pb-3' : 'pb-4' }}"
-                                >@if($isSelectable)<label class="flex items-center pt-0.5 flex-shrink-0" data-select-cell><input
-                                        type="checkbox"
-                                        x-on:change="toggle(@js((string) $recordKey))"
-                                        :checked="isSelected(@js((string) $recordKey))"
-                                        data-testid="table-card-select"
-                                        aria-label="{{ __('wire-table::messages.select_row') }}"
-                                        class="h-5 w-5 rounded border-gray-300 dark:border-gray-600 text-primary-600 focus:ring-primary-500 dark:focus:ring-offset-gray-800 touch-manipulation"
-                                ><span class="sr-only">{{ __('wire-table::messages.select_row') }}</span></label>@endif<div
-                                        class="flex-1 min-w-0"
-                                ><div class="flex items-baseline gap-3">@if($cardTitle)<div
-                                        class="min-w-0 font-medium text-gray-900 dark:text-white truncate text-base"
-                                >@if($recordUrl)<a
-                                        href="{{ $recordUrl }}"
-                                        class="hover:text-primary-600 dark:hover:text-primary-400"
-                                >{!! $mobileCell($cardTitle, $record) !!}</a>@else{!! $mobileCell($cardTitle, $record) !!}@endif</div>@endif{{--
-                                    Amounts line up on one right edge and use tabular figures, so
-                                    a column of them can be compared. --}}
-                                    @if($cardMetric)<div
-                                        class="ml-auto shrink-0 font-semibold text-gray-900 dark:text-white text-base tabular-nums whitespace-nowrap"
-                                        data-testid="table-card-metric"
-                                >{!! $mobileCell($cardMetric, $record) !!}</div>@endif</div>@if($cardSubtitle)<div
-                                        class="mt-0.5 text-sm text-gray-600 dark:text-gray-300 truncate"
-                                >{!! $mobileCell($cardSubtitle, $record) !!}</div>@endif
-                                    @if(count($cardMeta) > 0)<div
-                                        class="mt-1.5 flex flex-wrap items-center gap-2"
-                                >@foreach($cardMeta as $metaColumn)<span>{!! $mobileCell($metaColumn, $record) !!}</span>@endforeach</div>@endif</div>{{--
-                                    Only a collapsed group belongs beside the title: it is one icon
-                                    wide. Labelled buttons go to their own row below — sharing this
-                                    line, they take the width the identity needs and the title
-                                    collapses to nothing (min-w-0 does the rest). --}}
-                                    @if($hasMobileActions && $collapseMobileActions)<div
-                                        class="flex items-center justify-end flex-shrink-0 -mr-1"
-                                >{!! $mobileActionGroup->render($record, $actionClick) !!}</div>@endif</div>{{--
-                                Whatever no slot claimed, as the label/value grid --}}
-                                @if(count($cardDetails) > 0)<dl
-                                        class="px-4 pb-3 grid grid-cols-2 gap-x-4 gap-y-2 {{ $isSelectable ? 'pl-12' : '' }}"
-                                >@php $detailCount = count($cardDetails); @endphp
-                                    @foreach($cardDetails as $index => $column)
-                                        @php $isLastOdd = ($index === $detailCount - 1) && ($detailCount % 2 === 1); @endphp
-                                        <div class="{{ $isLastOdd ? 'col-span-2' : 'col-span-1' }}"><dt
-                                        class="text-xs text-gray-500 dark:text-gray-400 uppercase tracking-wide mb-0.5"
-                                >{{ $column->getLabel() }}</dt><dd
-                                        class="text-sm text-gray-900 dark:text-white"
-                                >{!! $mobileCell($column, $record) !!}</dd></div>@endforeach</dl>@endif
-                                @if($hasMobileActions && ! $collapseMobileActions)<div
-                                        class="flex flex-wrap items-center gap-2 px-4 pb-3 {{ $isSelectable ? 'pl-12' : '' }}"
-                                        data-testid="table-card-actions"
-                                >@foreach($mobileActions as $action){!! $action->render($record, $actionClick) !!}@endforeach</div>@endif{{--
-                                Sub-rows: the same children, subtotal, "show more" and per-child
-                                actions the desktop panel renders. Guarded here rather than inside
-                                the partial — the card's own toggle button lives there, in two
-                                branches. --}}
-                                @if($hasSubRows && $table->hasSubRowsFor($record))
-                                    @include('wire-table::tables.partials.sub-rows-mobile', [
-                                        'table' => $table,
-                                        'component' => $component,
-                                        'record' => $record,
-                                        'recordKey' => $recordKey,
-                                        'visibleSubRowColumns' => $visibleSubRowColumns,
-                                        'isExpanded' => $component->isRowExpanded($recordKey),
-                                        'isSubRowsExpandable' => $isSubRowsExpandable,
-                                        'isSelectable' => $isSelectable,
-                                    ])
-                                @endif</div>
-                            @empty
-                                <div class="px-4 py-12 text-center bg-white dark:bg-gray-800">
-                                    {{-- The same canonical surface the desktop table's empty state
-                                         uses, so a custom icon/description, the filter-empty reset
-                                         and the empty-state actions reach a phone too. The action
-                                         copies drop their keyboard shortcut: both layouts are in
-                                         the document at every width, and a rendered button binds
-                                         its shortcut as a window listener. --}}
-                                    @include('wire-core::partials.empty-state', [
-                                        'icon' => $isEmptyDueToFilter
-                                            ? 'outline:magnifying-glass'
-                                            : ($table->getEmptyStateIcon() ?? 'outline:inbox'),
-                                        'iconSize' => 'h-6 w-6',
-                                        'heading' => $isEmptyDueToFilter
-                                            ? __('wire-table::messages.empty_filter_heading')
-                                            : $table->getEmptyStateHeading(),
-                                        'description' => $isEmptyDueToFilter
-                                            ? __('wire-table::messages.empty_no_records_match')
-                                            : $table->getEmptyStateDescription(),
-                                        'actions' => $isEmptyDueToFilter
-                                            ? [view('wire-table::tables.partials.reset-filters-button')->render()]
-                                            : $table->getMobileEmptyStateActionsHtml(),
-                                    ])
-                                </div>
-                            @endforelse
-
-                            {{-- Totals for the card view. The desktop <tfoot> lives inside
-                                 the table this layout hides, so without this a phone shows
-                                 no totals at all. --}}
-                            @if($hasSummaries)
-                                @php $cardSummaryScope = $component->getSummaryScope(); @endphp
-                                @include('wire-table::tables.partials.summary-footer-mobile', [
-                                    'table' => $table,
-                                    'component' => $component,
-                                    'summaries' => $component->computeTableSummaries($cardSummaryScope),
-                                    'subRowGrandTotals' => $component->computeSubRowGrandTotals($cardSummaryScope),
-                                    'summaryScope' => $cardSummaryScope,
-                                    'summaryScopeOptions' => $component->getSummaryScopeOptions(),
-                                    'visibleColumns' => $visibleColumns,
-                                ])
-                            @endif
-                        </div>
-                    @endif
-
-                    {{-- Footer / Pagination --}}
-                    @if($isPaginated && $hasVisibleColumns)
-                        @php
-                            // $hasPaginator and the range come from the preamble — aria-rowindex
-                            // needs them before the body renders.
-                            $hasMultiplePages = $hasPaginator && $records->hasPages();
-                            $total = $recordCount;
-                            $from = $rangeFrom;
-                            $to = $rangeTo;
-                        @endphp
-
-                        <div
-                                class="px-4 lg:px-6 py-4 border-t border-gray-100 dark:border-gray-700 bg-gray-50/50 dark:bg-gray-800/30">
-                            <div class="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-                                {{-- Per Page Selector - Always visible when paginated --}}
-                                <div class="flex items-center gap-2">
-                                    <span class="text-sm text-gray-500 dark:text-gray-400">{{ __('wire-table::messages.show') }}</span>
-                                    <select
-                                            wire:model.live="tableState.pagination.perPage"
-                                            data-testid="table-per-page"
-                                            aria-label="{{ __('wire-table::messages.show') }}"
-                                            class="rounded-lg border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm text-gray-700 dark:text-gray-300 focus:border-primary-500 focus:ring-primary-500 py-1.5"
-                                    >
-                                        @foreach($table->getPerPageOptions() as $option)
-                                            {{-- Mark the live value server-side: without it the first
-                                                 paint shows the first option regardless of state, and a
-                                                 morph can snap the control back to it. --}}
-                                            <option value="{{ $option }}" @selected((int) $perPage === $option)>{{ $option === \NyonCode\WireTable\Table::PER_PAGE_ALL ? __('wire-table::messages.per_page_all') : $option }}</option>
-                                        @endforeach
-                                    </select>
-                                    <span class="text-sm text-gray-500 dark:text-gray-400">{{ __('wire-table::messages.records') }}</span>
-                                </div>
-
-                                {{-- Results Info - Always visible when paginated --}}
-                                <div class="text-sm text-gray-500 dark:text-gray-400">
-                                    {{ __('wire-table::messages.showing') }} <span
-                                            class="font-medium text-gray-700 dark:text-gray-300">{{ $from }}</span> -
-                                    <span class="font-medium text-gray-700 dark:text-gray-300">{{ $to }}</span> {{ __('wire-table::messages.of') }} <span
-                                            class="font-medium text-gray-700 dark:text-gray-300">{{ $total }}</span>
-                                    {{ __('wire-table::messages.records') }}
-                                </div>
-
-                                {{-- Pagination Links - Only when multiple pages --}}
-                                @if($hasMultiplePages)
-                                    <div>
-                                        {{ $records->links('wire-table::tables.partials.pagination') }}
-                                    </div>
-                                @endif
-                            </div>
-                        </div>
-                    @endif
+                         The region has its own `@php` scope because an island body
+                         cannot see one line of this view's locals. See the partial.
+                         --}}
+                    @island('data-region', always: true)
+                        @include('wire-table::tables.partials.data-region')
+                    @endisland
                 </div>
 
-                {{-- Action Modal --}}
-                @include('wire-table::tables.partials.action-modal')
+                {{-- Action Modal.
+
+                     An island, so opening one costs the modal instead of the whole
+                     table. The saving is not in skipping this island — a closed
+                     modal renders nothing anyway — it is that a call TARGETING an
+                     island makes Livewire skipRender() the component and return
+                     only the island, which is why the buttons carry
+                     wire:island="action-modals".
+
+                     `always` is load-bearing: without it an island is SKIPPED on
+                     every request after the mount unless that request targeted it,
+                     and a modal opened by anything other than a wire:island button
+                     — a keyboard shortcut, the row context menu, openOn(), a test
+                     calling the method — would simply never render. With it the
+                     behaviour is exactly today's, and a targeted call is the only
+                     thing that changes: it skips the rest of the table.
+
+                     $component is a view variable, and an island body sees only
+                     the component plus its public properties, so it is re-bound
+                     from $__livewire here. --}}
+                @island('action-modals', always: true)
+                    @php($component = $__livewire)
+                    @include('wire-table::tables.partials.action-modal')
+                @endisland
 
                 {{-- Halt Modal --}}
                 @include('wire-table::tables.partials.halt-modal')

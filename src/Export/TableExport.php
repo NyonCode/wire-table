@@ -7,7 +7,9 @@ namespace NyonCode\WireTable\Export;
 use Closure;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\Storage;
 use NyonCode\WireTable\Columns\Column;
+use NyonCode\WireTable\Exceptions\ExportException;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class TableExport
@@ -211,11 +213,102 @@ class TableExport
      */
     public function download(?Builder $query = null, ?array $columns = null): StreamedResponse
     {
+        [$exporter, $query, $columns, $summaryRows] = $this->prepare($query, $columns);
+
+        return $exporter->export($query, $columns, $this->fullFileName($exporter), $summaryRows);
+    }
+
+    /**
+     * Write the export to a disk instead of returning a download.
+     *
+     * The delivery a queued export needs: a job has no response to return, so it
+     * writes the file and hands back a path for the completion notification to
+     * link to. Everything before the last line is the same preparation
+     * {@see download()} does, which is why it is one method — an export that
+     * chose different columns depending on how it was delivered would be a bug
+     * nobody could see until they compared two files.
+     *
+     * @param  Builder<Model>|null  $query
+     * @param  array<int, Column>|null  $columns
+     * @param  string|null  $disk  Defaults to the filesystem's own default.
+     * @return string The path within the disk.
+     */
+    public function store(?Builder $query = null, ?array $columns = null, ?string $disk = null, string $directory = 'exports'): string
+    {
+        [$exporter, $query, $columns, $summaryRows] = $this->prepare($query, $columns);
+
+        $storage = Storage::disk($disk);
+        $path = trim($directory, '/').'/'.$this->fullFileName($exporter);
+
+        // Written through a temp file rather than straight to the disk: a disk
+        // may be S3, and the exporters write with fopen()/openToFile(), which
+        // need a real stream. The upload is one put() afterwards.
+        $temp = tempnam(sys_get_temp_dir(), 'wire-export');
+
+        // Marked rather than covered, on the same grounds as the notification
+        // guard in RunExportJob. tempnam() falls back to the system temp
+        // directory whenever the one it is handed is unusable — measured
+        // returning a path for `/nonexistent`, `/` and `/dev/null` alike — so
+        // `false` means the machine has no writable temp directory at all, and
+        // no test can put it there. The guard stays because the return type is
+        // `string|false` and because the day it does fire, this is the sentence
+        // that should reach the log.
+        // @codeCoverageIgnoreStart
+        if ($temp === false) {
+            throw ExportException::noTemporaryFile();
+        }
+        // @codeCoverageIgnoreEnd
+
+        try {
+            $exporter->writeTo($temp, $query, $columns, $summaryRows);
+
+            // Suppressed for the same reason as the writers: without it the
+            // warning becomes an ErrorException about `fopen` and the caller
+            // never learns which step of the export failed. An exporter that
+            // wrote nothing is the case this catches.
+            $handle = @fopen($temp, 'r');
+
+            if ($handle === false) {
+                throw ExportException::unreadableTemporaryFile($temp);
+            }
+
+            $storage->put($path, $handle);
+
+            if (is_resource($handle)) {
+                fclose($handle);
+            }
+        } finally {
+            @unlink($temp);
+        }
+
+        return $path;
+    }
+
+    /**
+     * The name the file gets.
+     *
+     * Ask the exporter when there is one: it, not the format, knows whether it
+     * could honour the format at all. See {@see Contracts\Exporter::extension()}.
+     */
+    public function fullFileName(?Contracts\Exporter $exporter = null): string
+    {
+        return $this->fileName.'.'.($exporter?->extension() ?? $this->format->extension());
+    }
+
+    /**
+     * Everything both deliveries need, resolved once.
+     *
+     * @param  Builder<Model>|null  $query
+     * @param  array<int, Column>|null  $columns
+     * @return array{0: Contracts\Exporter, 1: Builder<Model>, 2: array<int, Column>, 3: array<int, array<int, string>>}
+     */
+    protected function prepare(?Builder $query, ?array $columns): array
+    {
         $query = $query ?? $this->query;
         $columns = $columns ?? $this->columns ?? [];
 
         if ($query === null) {
-            throw new \RuntimeException('No query defined for export.');
+            throw ExportException::noQuery();
         }
 
         if ($this->modifyQueryCallback) {
@@ -225,13 +318,12 @@ class TableExport
         // Filter to only visible columns
         $columns = array_values(array_filter($columns, fn (Column $col) => $col->canView()));
 
-        $exporter = $this->resolveExporter();
-
-        $fullFileName = $this->fileName.'.'.$this->format->extension();
-
-        $summaryRows = $this->withSummaries ? $this->buildSummaryRows($query, $columns) : [];
-
-        return $exporter->export($query, $columns, $fullFileName, $summaryRows);
+        return [
+            $this->resolveExporter(),
+            $query,
+            $columns,
+            $this->withSummaries ? $this->buildSummaryRows($query, $columns) : [],
+        ];
     }
 
     /**

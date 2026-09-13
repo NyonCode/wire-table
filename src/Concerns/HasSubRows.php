@@ -220,18 +220,6 @@ trait HasSubRows
     }
 
     /**
-     * Start with every row's children open.
-     *
-     * @deprecated Flatten mode never flattened anything — it was a second flag
-     *             with the same visible effect as {@see subRowsDefaultExpanded()},
-     *             which it now delegates to.
-     */
-    public function flattenSubRows(bool $flatten = true): static
-    {
-        return $this->subRowsDefaultExpanded($flatten);
-    }
-
-    /**
      * Enable independent filtering of sub-rows.
      */
     public function subRowsFilterable(bool $filterable = true): static
@@ -415,6 +403,22 @@ trait HasSubRows
         return $this->subRowColumns;
     }
 
+    /**
+     * The sub-row columns this viewer may actually see.
+     *
+     * canView() can hit the Gate, so it is resolved once per parent rather than
+     * once per cell — and it is resolved *here*, because every renderer that
+     * needs the list (the render plan, the desktop panel, the stacked card)
+     * would otherwise carry its own array_filter and drift the moment the rule
+     * grows a second clause.
+     *
+     * @return array<int, Column>
+     */
+    public function getViewableSubRowColumns(): array
+    {
+        return array_values(array_filter($this->subRowColumns, fn (Column $column) => $column->canView()));
+    }
+
     public function getSubRowQueryCallback(): ?Closure
     {
         return $this->subRowQueryCallback;
@@ -428,14 +432,6 @@ trait HasSubRows
     public function isSubRowsExpandable(): bool
     {
         return $this->subRowsExpandable;
-    }
-
-    /**
-     * @deprecated Use {@see isSubRowsDefaultExpanded()}.
-     */
-    public function isFlattenSubRows(): bool
-    {
-        return $this->subRowsDefaultExpanded;
     }
 
     public function isSubRowsFilterable(): bool

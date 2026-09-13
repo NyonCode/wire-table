@@ -96,6 +96,25 @@ trait CanExpandSubRows
      */
     public function toggleAllRowExpansion(): void
     {
+        // This one setting is shown in two places on opposite sides of the
+        // `data-region` island: the chevron in the header row, and the "expand on
+        // every row" checkbox in the toolbar's view menu. Livewire targets the
+        // nearest enclosing island automatically, so the chevron's click would
+        // come back as the region alone and leave the checkbox showing the old
+        // value — `verify-subrows-expansion.mjs` is what noticed.
+        //
+        // So this write opts out of island rendering and takes the full render.
+        // It is a once-in-a-while table-wide switch, not a per-row or per-keystroke
+        // path, and the two controls agreeing is worth more than the saving.
+        //
+        // `forceRender()` rather than the `skipIslandsRender()` this used to call:
+        // Livewire removed that pair in v4.4.1 along with the store flag behind it
+        // (it existed to serve `#[Renderless]`, which now reads the attribute off
+        // the method instead). What is left is the switch that outranks the
+        // `skipRender()` the island path takes — set before the method returns, so
+        // it is already there when that path runs.
+        $this->forceRender();
+
         $this->setSubRowsExpandAll(! $this->expandsSubRowsByDefault());
     }
 
@@ -125,15 +144,6 @@ trait CanExpandSubRows
 
         // Against a default-expanded baseline the list tracks *collapsed* rows.
         return $this->expandsSubRowsByDefault() ? ! $isException : $isException;
-    }
-
-    /**
-     * @deprecated Flatten mode is now the expansion baseline — use
-     *             {@see toggleAllRowExpansion()}.
-     */
-    public function toggleFlattenMode(): void
-    {
-        $this->toggleAllRowExpansion();
     }
 
     /**
@@ -175,8 +185,8 @@ trait CanExpandSubRows
             // A limited eager load (subRowsLimit) ships a loadCount alongside.
             // If show-all was enabled after loading, memory holds only `limit`
             // rows — fall through to the query for this parent's full set.
-            $loadedCount = $record->getAttribute(Str::snake($relation).'_count');
-            $isPartialLoad = $loadedCount !== null && $items->count() < (int) $loadedCount;
+            $loadedCount = $this->getLoadedSubRowCount($record);
+            $isPartialLoad = $loadedCount !== null && $items->count() < $loadedCount;
 
             if (! ($showAll && $isPartialLoad)) {
                 if (! $showAll && $table->getSubRowsLimit()) {
@@ -378,16 +388,30 @@ trait CanExpandSubRows
      */
     protected function applyInteractiveSubRowFilters(Builder $query): Builder
     {
-        return app(SubRowFilters::class)->applyInteractive($query, $this->getTable(), $this->tableState->get('rows.subRowFilters', []));
+        return app(SubRowFilters::class)->applyInteractive($query, $this->getTable(), $this->getSubRowFilterValues());
+    }
+
+    /**
+     * The interactive sub-row filter bar's raw state.
+     *
+     * Public because the panel that renders the bar has to know what is in the
+     * slots, and reaching into `tableState` from a view is how the rule for
+     * reading them ended up written twice.
+     *
+     * @return array<string, mixed>
+     */
+    public function getSubRowFilterValues(): array
+    {
+        return $this->tableState->get('rows.subRowFilters', []) ?? [];
     }
 
     /**
      * Whether at least one interactive sub-row filter is active. Disables the
      * eager-load / in-memory fast paths, which would bypass per-parent filtering.
      */
-    protected function hasActiveSubRowFilters(): bool
+    public function hasActiveSubRowFilters(): bool
     {
-        return app(SubRowFilters::class)->hasActiveInteractive($this->getTable(), $this->tableState->get('rows.subRowFilters', []));
+        return app(SubRowFilters::class)->hasActiveInteractive($this->getTable(), $this->getSubRowFilterValues());
     }
 
     /**
@@ -482,15 +506,11 @@ trait CanExpandSubRows
         $relation = $table->getSubRowRelation();
         if ($record->relationLoaded($relation) && ! $this->hasActiveSubRowFilters()) {
             // Limited eager loads (subRowsLimit) ship an exact loadCount
-            // alongside — prefer it; the loaded relation itself holds only
-            // `limit` rows, so counting it would always cap at the limit.
-            $loadedCount = $record->getAttribute(Str::snake($relation).'_count');
-
-            if ($loadedCount !== null) {
-                return (int) $loadedCount;
-            }
-
-            return $record->getRelation($relation)->count();
+            // alongside — getLoadedSubRowCount() prefers it; the loaded relation
+            // itself holds only `limit` rows, so counting it would always cap at
+            // the limit. Inside this branch the relation *is* loaded, so the
+            // count is never null.
+            return $this->getLoadedSubRowCount($record) ?? 0;
         }
 
         $query = $table->getSubRowsQuery($record, $this->getSubRowSort(), applyLimit: false);
@@ -500,5 +520,42 @@ trait CanExpandSubRows
         $query = $this->applyInteractiveSubRowFilters($query);
 
         return $query->count();
+    }
+
+    /**
+     * How many children this parent has **without asking the database** — or
+     * null when nothing in memory can answer.
+     *
+     * Two things can answer, and the order between them is the rule: a
+     * `*_count` attribute (shipped by the limited eager load's loadCount, or by
+     * a consumer's own `->withCount()`) is exact, while a loaded relation holds
+     * only as many rows as it was allowed to load — so counting it under a
+     * `subRowsLimit` would always report the limit.
+     *
+     * It is *not* the authoritative total: a `withCount()` the consumer wrote
+     * is unconstrained by `subRowQuery()` and by scoped sub-row filters, which
+     * is why {@see getSubRowsTotalCount()} only trusts this once the relation is
+     * loaded — the state the framework's own constrained eager load leaves
+     * behind. A caller that wants a cheap hint rather than a total (the stacked
+     * card's collapsed "N items" label) asks this directly and renders nothing
+     * when the answer is null.
+     */
+    public function getLoadedSubRowCount(mixed $record): ?int
+    {
+        $relation = $this->getTable()->getSubRowRelation();
+
+        if ($relation === null || ! $record instanceof Model) {
+            return null;
+        }
+
+        $countAttribute = $record->getAttribute(Str::snake($relation).'_count');
+
+        if ($countAttribute !== null) {
+            return (int) $countAttribute;
+        }
+
+        return $record->relationLoaded($relation)
+            ? $record->getRelation($relation)->count()
+            : null;
     }
 }

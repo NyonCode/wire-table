@@ -12,27 +12,28 @@ use Illuminate\Contracts\Pagination\Paginator;
 use Illuminate\Contracts\View\View;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Eloquent\Relations\HasOneOrMany;
-use Illuminate\Database\Eloquent\Relations\MorphOneOrMany;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Validation\ValidationException;
 use Livewire\Component;
 use Livewire\WithPagination;
 use NyonCode\WireCore\Actions\Action;
 use NyonCode\WireCore\Actions\Concerns\InteractsWithActions;
+use NyonCode\WireCore\Core\Data\PagingRequest;
 use NyonCode\WireCore\Core\Events\CellUpdating;
-use NyonCode\WireCore\Core\Events\TableFiltered;
-use NyonCode\WireCore\Core\Events\TableFiltering;
-use NyonCode\WireCore\Core\Events\TableSearched;
-use NyonCode\WireCore\Core\Events\TableSearching;
+use NyonCode\WireCore\Core\Plugin\HookDispatch;
+use NyonCode\WireCore\Core\Plugin\Hooks\ExportConfiguringPayload;
+use NyonCode\WireCore\Core\Plugin\Hooks\ImportConfiguringPayload;
+use NyonCode\WireCore\Core\Plugin\Hooks\TableComposingPayload;
+use NyonCode\WireCore\Core\Plugin\HookTarget;
+use NyonCode\WireCore\Core\Query\QueryPlan;
 use NyonCode\WireCore\Core\State\StateContainer;
-use NyonCode\WireCore\Core\Support\Deprecation;
-use NyonCode\WireCore\Core\Validation\ValidationPipeline;
-use NyonCode\WireCore\Foundation\Contracts\DehydratesState;
+use NyonCode\WireCore\Core\Support\Trans;
+use NyonCode\WireCore\Foundation\Concerns\InteractsWithPartials;
+use NyonCode\WireCore\Foundation\Enums\Hook;
+use NyonCode\WireCore\Foundation\Preferences\Contracts\PreferenceDriver;
 use NyonCode\WireCore\Notifications\Notification;
 use NyonCode\WireForms\Concerns\DispatchesStateUpdates;
 use NyonCode\WireForms\Concerns\InteractsWithActionForms;
@@ -43,22 +44,34 @@ use NyonCode\WireForms\Concerns\InteractsWithSelectCreation;
 use NyonCode\WireForms\Concerns\InteractsWithWizards;
 use NyonCode\WireForms\Forms\Form;
 use NyonCode\WireTable\Columns\Column;
+use NyonCode\WireTable\Data\EloquentDataSource;
 use NyonCode\WireTable\Events\TableRecordsChanged;
 use NyonCode\WireTable\Export\ExportAction;
 use NyonCode\WireTable\Export\ExportFormat;
+use NyonCode\WireTable\Export\Jobs\RunExportJob;
 use NyonCode\WireTable\Export\TableExport;
 use NyonCode\WireTable\Filters\Filter;
 use NyonCode\WireTable\Import\ImportAction;
+use NyonCode\WireTable\Import\ImportColumn;
 use NyonCode\WireTable\Import\ImportResult;
+use NyonCode\WireTable\Import\Jobs\RunImportJob;
 use NyonCode\WireTable\Import\TableImport;
-use NyonCode\WireTable\Preferences\Contracts\TablePreferenceDriver;
 use NyonCode\WireTable\Preferences\TablePreferenceManager;
+use NyonCode\WireTable\Preferences\TableViewPayload;
 use NyonCode\WireTable\Services\CellEditPipeline;
+use NyonCode\WireTable\Services\SubRowQuery;
 use NyonCode\WireTable\Services\SummaryBatch;
+use NyonCode\WireTable\Services\SummarySet;
 use NyonCode\WireTable\Services\TableQueryCacheKey;
+use NyonCode\WireTable\Services\TableQueryEvents;
 use NyonCode\WireTable\Services\TableQueryService;
 use NyonCode\WireTable\Services\WriteGeneration;
 use NyonCode\WireTable\Support\CellEditOutcome;
+use NyonCode\WireTable\Support\RowRenderer;
+use NyonCode\WireTable\Support\RowStamps;
+use NyonCode\WireTable\Support\StateInvalidation;
+use NyonCode\WireTable\Support\TablePartials;
+use NyonCode\WireTable\Support\TableRenderPlan;
 use NyonCode\WireTable\Table;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 use Throwable;
@@ -70,6 +83,7 @@ trait WithTable
 {
     use CanExpandSubRows;
     use CanFillCells;
+    use CanGroupRecords;
     use CanSelectRecords;
     use DispatchesStateUpdates;
     use HasSqlDebug;
@@ -96,6 +110,11 @@ trait WithTable
     }
     use InteractsWithFieldActions;
     use InteractsWithFileUploads;
+
+    // Lets a write render the regions it touched instead of the whole table. The
+    // engine is here; the table's own anchors and the flag that turns them on are
+    // the next slice — nothing calls renderPartial() yet.
+    use InteractsWithPartials;
     use InteractsWithRepeaters;
     use InteractsWithSelectCreation;
     use InteractsWithTableModals;
@@ -153,6 +172,27 @@ trait WithTable
     /** @var LengthAwarePaginator|Paginator|CursorPaginator|Collection|null Cached records for current request lifecycle */
     protected LengthAwarePaginator|Paginator|CursorPaginator|Collection|null $cachedRecords = null;
 
+    /**
+     * @var TableRenderPlan|null What this render resolved, shared by the view and
+     *                           any island body. Held for the length of ONE
+     *                           render — see tableRenderPlan().
+     */
+    protected ?TableRenderPlan $renderPlan = null;
+
+    /**
+     * Totals resolved so far this render, keyed by scope.
+     *
+     * @var array<string, array<string, array<int, array<string, mixed>>>>
+     */
+    protected array $summaryMemo = [];
+
+    /**
+     * Sub-row grand totals resolved so far this render, keyed by scope.
+     *
+     * @var array<string, array<string, array<int, array<string, mixed>>>>
+     */
+    protected array $subRowGrandTotalMemo = [];
+
     /** @var Builder<Model>|null Cached query builder so summaries don't re-plan the query */
     protected ?Builder $cachedQuery = null;
 
@@ -162,117 +202,18 @@ trait WithTable
     // $cachedSelectedRecords comes from CanSelectRecords.
 
     /**
-     * Memoized page records partitioned by group value, in page order.
-     * Each entry: ['value' => mixed, 'records' => Collection].
-     *
-     * @var array<int, array{value: mixed, records: Collection<int, Model>}>|null
-     */
-    protected ?array $cachedGroupPartitions = null;
-
-    /**
      * Initialize table state via StateContainer.
      */
     public function mountWithTable(): void
     {
+        // Seeded with the bare defaults before getTable(), because a consumer's
+        // table() may read state while it configures — then replaced with what
+        // this table's own configuration decides.
         $this->tableState = new StateContainer(TableStateSchema::defaults());
 
         $table = $this->getTable();
 
-        // If lazy loading is enabled, don't load data yet
-        $this->tableState->set('ready', ! $table->isLazy());
-
-        if ($table->getDefaultSort()) {
-            $this->tableState->set('sort.column', $table->getDefaultSort());
-            $this->tableState->set('sort.direction', $table->getDefaultSortDirection());
-        }
-
-        $this->tableState->set('pagination.perPage', $table->getPerPage());
-
-        // Initialize filters with defaults (wrapped to match form-field state shape).
-        // Every *rendered* filter gets a slot, not only the ones with a default:
-        // non-native filters bind through $wire.entangle(), and Livewire's entangle
-        // silently no-ops when the path is undefined at render, so a filter without
-        // a default would never reach the server. A null value stays inactive
-        // everywhere — apply() ignores it and it is not counted as an active filter.
-        $filters = [];
-        foreach ($table->getFilters() as $filter) {
-            $default = $filter->getDefault();
-
-            // A hidden filter renders no control to bind, so it only needs a slot
-            // when a default actually forces a value into the query.
-            if ($default === null && ! $filter->canView()) {
-                continue;
-            }
-
-            // Arr::set so dotted (relation) filter names nest the same way the
-            // live wire:model binding writes them — keeps init and UI in sync.
-            Arr::set($filters, $filter->getName(), $filter->wrapValue($default));
-        }
-        if ($filters !== []) {
-            $this->tableState->set('filters', $filters);
-        }
-
-        // Initialize hidden columns (columns that start hidden)
-        $hidden = [];
-        foreach ($table->getColumns() as $column) {
-            if ($column->isToggleable() && ! $column->isVisible()) {
-                $hidden[] = $column->getName();
-            }
-        }
-        if ($hidden !== []) {
-            $this->tableState->set('columns.hidden', $hidden);
-        }
-
-        // Every column filter needs a state slot up front, for the same reason the
-        // panel filters above do: the header controls entangle their path, and an
-        // undefined path makes Livewire's entangle a silent no-op.
-        //
-        // Multi-select filters must specifically start as an *array* so Livewire
-        // treats their header checkboxes as an array group (toggle membership)
-        // rather than replacing a scalar on each click.
-        foreach ($table->getColumns() as $column) {
-            if (! $column->isFilterable()) {
-                continue;
-            }
-
-            $path = 'columnFilters.'.$column->getName();
-            $current = $this->tableState->get($path);
-
-            if ($column->filterExpectsArray()) {
-                if (! is_array($current)) {
-                    $this->tableState->set($path, []);
-                }
-
-                continue;
-            }
-
-            if ($current === null) {
-                $this->tableState->set($path, null);
-            }
-        }
-
-        // Sub-row filter columns need the same up-front slot, for the same
-        // entangle-no-op reason: an interactive sub-row filter bar binds each
-        // control to rows.subRowFilters.<name>, and a select/multi-select there
-        // entangles that path.
-        if ($table->isSubRowsFilterable()) {
-            foreach ($table->getSubRowColumns() as $column) {
-                if (! $column->isFilterable()) {
-                    continue;
-                }
-
-                $path = 'rows.subRowFilters.'.$column->getName();
-                $current = $this->tableState->get($path);
-
-                if ($column->filterExpectsArray()) {
-                    if (! is_array($current)) {
-                        $this->tableState->set($path, []);
-                    }
-                } elseif ($current === null) {
-                    $this->tableState->set($path, null);
-                }
-            }
-        }
+        $this->tableState->replace(TableStateSchema::initialFor($table));
 
         // Per-user view layout (columns, sub-row expansion): a saved preference
         // (if any) overrides the configured defaults above.
@@ -281,80 +222,6 @@ trait WithTable
         // Query-string persistence: seed state from the URL (URL wins over
         // the defaults applied above) and register URL-tracking attributes.
         $this->initializeTableQueryString($table);
-    }
-
-    // ==========================================
-    // Backward Compatibility (Deprecated Properties)
-    // ==========================================
-
-    /**
-     * Magic getter for backward compatibility with legacy property names.
-     *
-     * @deprecated Access state via $this->tableState->get() instead.
-     */
-    public function __get($name): mixed
-    {
-        $map = TableStateSchema::legacyPropertyMap();
-
-        if (isset($map[$name]) && isset($this->tableState)) {
-            Deprecation::property(static::class, $name, "tableState->get('{$map[$name]}')");
-
-            return $this->tableState->get($map[$name]);
-        }
-
-        // Let parent __get handle it (Livewire trait magic)
-        if (is_subclass_of(static::class, Component::class)) {
-            return parent::__get($name);
-        }
-
-        return null;
-    }
-
-    /**
-     * Magic setter for backward compatibility with legacy property names.
-     *
-     * @deprecated Access state via $this->tableState->set() instead.
-     */
-    public function __set($name, $value): void
-    {
-        $map = TableStateSchema::legacyPropertyMap();
-
-        if (isset($map[$name])) {
-            if (! isset($this->tableState)) {
-                // tableState not yet initialised — mountWithTable() hasn't run.
-                // This write will be overwritten when mount runs (filter/sort/pagination
-                // defaults are applied there). Move legacy writes into mountWithTable().
-                $this->tableState = new StateContainer(TableStateSchema::defaults());
-            }
-
-            Deprecation::property(static::class, $name, "tableState->set('{$map[$name]}', \$value)");
-            $this->tableState->set($map[$name], $value);
-
-            return;
-        }
-
-        // Let parent __set handle it (Livewire trait magic)
-        if (is_subclass_of(static::class, Component::class) && method_exists(get_parent_class(static::class), '__set')) {
-            parent::__set($name, $value);
-        }
-    }
-
-    /**
-     * Magic isset for backward compatibility with legacy property names.
-     */
-    public function __isset($name): bool
-    {
-        $map = TableStateSchema::legacyPropertyMap();
-
-        if (isset($map[$name])) {
-            return $this->tableState->has($map[$name]);
-        }
-
-        if (is_subclass_of(static::class, Component::class)) {
-            return parent::__isset($name);
-        }
-
-        return false;
     }
 
     /**
@@ -382,36 +249,34 @@ trait WithTable
             $this->normalizeSelectionMode();
         }
 
-        $resetPaths = [
-            'pagination.perPage',
-            'search',
-            'filters',
-            'columnFilters',
-            'sort.column',
-            'sort.direction',
-        ];
+        // What the write invalidates is a decision about the path; doing the
+        // resetting is this host's job. See StateInvalidation for the rules,
+        // including why a re-sort leaves the selection alone and a filter does
+        // not.
+        $invalidated = StateInvalidation::forPath($path);
 
-        foreach ($resetPaths as $resetPath) {
-            if ($path === $resetPath || str_starts_with($path, $resetPath.'.')) {
-                if ($path === 'pagination.perPage') {
-                    $this->normalizePerPage();
-                }
-
-                // The view this render must produce is not the one the poll
-                // checksum was taken for — see refreshTable().
-                $this->markTableViewChanged();
-
-                // "Everything the filter matches" is defined by the filter that
-                // was on screen. Narrowing the set while that selection stands
-                // would silently redefine what a bulk action is about to touch.
-                if ($path !== 'sort.column' && $path !== 'sort.direction' && $path !== 'pagination.perPage') {
-                    $this->resetSelectionScope();
-                }
-
-                $this->resetPage();
-
-                return;
+        if ($invalidated !== null) {
+            if ($invalidated->normalisesPerPage) {
+                $this->normalizePerPage();
             }
+
+            if ($invalidated->marksViewChanged) {
+                $this->markTableViewChanged();
+            }
+
+            if ($invalidated->resetsSelectionScope) {
+                $this->resetSelectionScope();
+            }
+
+            if ($invalidated->resetsPage) {
+                $this->resetPage();
+            }
+
+            if ($invalidated->clearsCursor) {
+                $this->tableState->set('pagination.cursor', null);
+            }
+
+            return;
         }
 
         // A field inside an action/halt modal form changed — run its reactive
@@ -480,9 +345,43 @@ trait WithTable
         if ($this->tableInstance === null) {
             $this->tableInstance = $this->table(($this->wireTableClass)::make());
             $this->tableInstance->livewireComponent($this);
+            $this->composeTableThroughPlugins($this->tableInstance);
         }
 
         return $this->tableInstance;
+    }
+
+    /**
+     * Let anything installed change this table before anything reads it.
+     *
+     * Here rather than in the query service, and that placement is the whole
+     * point: `table.configuring` runs inside `TableQueryService` on the arrays
+     * the planner is about to consume, so a column added there is searched and
+     * sorted on and never rendered. This runs on the composed instance, once,
+     * next to the line that gives it its host — so a column added by a plugin is
+     * a column the user sees.
+     *
+     * Guarded by `hasHook()` rather than by the payload's own early return: the
+     * two setters below would otherwise re-wrap the column set on every table in
+     * an application that installs no plugins at all. That guard is
+     * {@see HookDispatch}'s since the surface grew to eight hooks — the check was
+     * being written out at each new dispatch site, which is how one of them ends
+     * up missing it.
+     */
+    private function composeTableThroughPlugins(Table $table): void
+    {
+        $payload = HookDispatch::typed(Hook::TableComposing, fn () => new TableComposingPayload(
+            table: $table,
+            columns: $table->getColumns(),
+            filters: $table->getFilters(),
+            target: HookTarget::for('table', $this, $table->getModelClass()),
+        ));
+
+        if ($payload === null) {
+            return;
+        }
+
+        $table->columns($payload->columns)->filters($payload->filters);
     }
 
     /**
@@ -535,9 +434,94 @@ trait WithTable
             return;
         }
 
-        // Simply re-render - Livewire will fetch new data
-        // The table instance is recreated on each request
+        // The table instance is recreated on each request, so dropping it is what
+        // makes the poll fetch new data.
         $this->tableInstance = null;
+
+        // …and where the table asked for row partials, send the rows that moved
+        // rather than the page they sit in. This is the freshness half of the ERP
+        // case: while several people edit one table, a colleague's write should
+        // repaint their row and leave everything else — including whatever the
+        // reader has half-typed in a cell of their own — untouched.
+        $this->queueChangedRowPartials();
+    }
+
+    /**
+     * Queue a partial for each row whose data moved since the last poll.
+     *
+     * Which rows changed is worked out **server-side, from this component's own
+     * page**, and deliberately not carried on the broadcast: the channel is
+     * scoped to a model class rather than to a viewer, so putting record keys on
+     * it would tell every listener which records exist and change — including the
+     * ones their own query would never return. The event stays a bare "something
+     * moved" signal and each listener answers it for its own rows.
+     *
+     * A row is "the same row" by key and "unchanged" by a hash of its own
+     * attributes. Deliberately not the `updated_at` the optimistic lock uses:
+     * that column is stored to the second, so two writes inside one second look
+     * identical and the second one would never be sent. Hashing what the record
+     * holds costs nothing extra — the page is already in memory — and sees every
+     * change to the record itself.
+     *
+     * It shares the blind spot of `pollChangeDetection()`'s default: a change
+     * that never touches the parent row (a child-table rollup, a computed column)
+     * is invisible to it, and a table that renders one should say so with a
+     * `pollChangeDetection()` closure, which decides whether the poll renders at
+     * all before this is reached.
+     *
+     * The hashes live in the poll state, which costs the snapshot a few bytes a
+     * row and is why this only runs where row partials are on.
+     *
+     * **The key SET changing means a full render**, and that is not a shortcut: a
+     * row that arrived, left, or moved under the sort is a change no per-row
+     * partial can express — the page's shape moved, not a row's contents.
+     */
+    protected function queueChangedRowPartials(): void
+    {
+        $table = $this->getTable();
+
+        if (! $table->usesRowPartials() || ! method_exists($this, 'renderPartial')) {
+            return;
+        }
+
+        $key = $table->getPrimaryKey();
+
+        $ordered = [];
+
+        foreach ($this->getTableRecords() as $record) {
+            $ordered[(string) $record->{$key}] = $record;
+        }
+
+        $stamps = RowStamps::of($ordered, $key);
+        $changed = RowStamps::changed($this->tableState->get('polling.rows'), $stamps);
+
+        $this->tableState->set('polling.rows', $stamps);
+
+        // Null, not empty: the page holds different rows than last time, so no
+        // per-row partial can describe what happened and the full render stands.
+        if ($changed === null) {
+            return;
+        }
+
+        // Nothing moved, and this knew it per row rather than from a checksum over
+        // the set — so the poll can answer with nothing at all. That is the common
+        // case on a table nobody is editing, and the cheapest answer there is.
+        if ($changed === []) {
+            $this->skipTableRender();
+
+            return;
+        }
+
+        $partials = TablePartials::for($table, $this, $this->tableRenderPlan());
+        $moved = array_intersect_key($ordered, array_flip($changed));
+
+        foreach ($partials->rows($ordered, $changed) as $name => $html) {
+            $this->renderPartial($name, $html);
+        }
+
+        foreach ($partials->satellites($moved) as $name => $html) {
+            $this->renderPartial($name, $html);
+        }
     }
 
     /**
@@ -671,20 +655,15 @@ trait WithTable
             return (string) $detector($query);
         }
 
-        $model = $query->getModel();
+        // The COUNT/MAX half belongs to whatever the rows come from, so it is
+        // asked of the source rather than assembled here. Built over *this*
+        // query — the narrowed one — because that is the set being polled, not
+        // the table's base query.
+        $token = (new EloquentDataSource($query))->changeToken(new QueryPlan);
 
-        if (! $model->usesTimestamps() || $model->getUpdatedAtColumn() === null) {
+        if ($token === null) {
             return null;
         }
-
-        $updatedAt = $query->getQuery()->getGrammar()->wrap(
-            $query->qualifyColumn($model->getUpdatedAtColumn()),
-        );
-
-        $base = $query->toBase();
-        $base->select([]);
-        $base->selectRaw("COUNT(*) as wt_count, MAX({$updatedAt}) as wt_max");
-        $row = $base->first();
 
         // The write generation is the third term, and it is what makes this
         // usable. `updated_at` is stored to the second, so an edit landing in the
@@ -693,9 +672,11 @@ trait WithTable
         // shown late, because the next tick compares against that same second. The
         // counter moves on every write through a table whatever the clock says,
         // while COUNT and MAX still catch a write that never went through one.
+        // It is the half no data source can answer for: it is about this
+        // application's writes, not about the dataset.
         $generation = app(WriteGeneration::class)->current($this->queryCacheScope($this->getTable()));
 
-        return ($row->wt_count ?? 0).'|'.($row->wt_max ?? '').'|'.$generation;
+        return $token.'|'.$generation;
     }
 
     /**
@@ -790,6 +771,42 @@ trait WithTable
     }
 
     /**
+     * What this render resolved — see {@see TableRenderPlan}.
+     *
+     * Deliberately NOT memoised across renders. The plan reads table state, and
+     * a request is free to write state before it renders (a filter, a cell edit,
+     * a page change); a memo living longer than one render would hand the second
+     * render the first one's answers. {@see getTableProperty()} therefore drops
+     * it as each render begins, and this rebuilds on demand — which is exactly
+     * what the view's `@php` block used to do, so it costs nothing new.
+     *
+     * The memo is what makes it shareable WITHIN a render: the main view and
+     * every island body resolve the same instance rather than each rebuilding.
+     *
+     * **Resolved on first use, not handed to the view.** That is load-bearing
+     * rather than lazy for its own sake: a view is allowed to reconfigure the
+     * table before the part that reads the plan renders, and one does —
+     * `wire-sortable`'s table view applies the user's persisted column order by
+     * calling `$table->columns(...)` in its own `@php` block, ahead of including
+     * wire-table's view. A plan built in this method, when the innermost view
+     * asks for it, sees that order; a plan built here in `getTableProperty()` saw
+     * the order the component declared and silently undid the reorder.
+     */
+    public function tableRenderPlan(): TableRenderPlan
+    {
+        // The records are sourced here rather than required as an argument so an
+        // island body can ask for the plan with nothing but the component. They
+        // are memoised by getTableRecords() for every path except lazy-not-ready,
+        // which returns a fresh empty collection each call — value-identical, so
+        // the plan agrees with the view either way.
+        return $this->renderPlan ??= TableRenderPlan::build(
+            $this->getTable(),
+            $this,
+            $this->getTableRecords(),
+        );
+    }
+
+    /**
      * Render the table view.
      */
     public function getTableProperty(): View
@@ -799,6 +816,12 @@ trait WithTable
         $viewName = method_exists($this, 'getTableView')
             ? $this->getTableView()
             : (method_exists($table, 'getViewName') ? $table->getViewName() : 'wire-table::tables.index');
+
+        // A new render, so a new plan. Dropped rather than built: the view
+        // resolves it when it first needs it — see tableRenderPlan().
+        $this->renderPlan = null;
+        $this->summaryMemo = [];
+        $this->subRowGrandTotalMemo = [];
 
         return view($viewName, [
             'table' => $table,
@@ -832,6 +855,14 @@ trait WithTable
             $intercepted = $this->interceptTableRecords();
             if ($intercepted !== null) {
                 $this->cachedRecords = $intercepted;
+
+                // An intercepted set is still a page of records, and its sub-rows
+                // still have to be batched. Returning without this sent reorder
+                // mode down the per-parent N+1 the eager load exists to remove —
+                // on the one mode that also drops pagination, so with the most
+                // parents on the page. Pinned by wire-sortable's
+                // ReorderSubRowLoadTest.
+                $this->eagerLoadSubRows($this->cachedRecords);
 
                 return $this->cachedRecords;
             }
@@ -883,6 +914,31 @@ trait WithTable
     }
 
     /**
+     * Move a cursor-paginated table, which nothing else can do for it.
+     *
+     * Livewire's pagination is page-based — `previousPage()`, `nextPage()`,
+     * `gotoPage()` — and offers no cursor equivalent, so a `CursorPaginator` had
+     * no control that could drive it: the rows paged correctly but only through a
+     * `cursor` query parameter nobody was setting. The cursor therefore lives in
+     * table state, where the rest of this table's paging already lives, and the
+     * pagination partial hands back the encoded cursor the paginator itself
+     * produced.
+     *
+     * `null` returns to the first page, which is what the paginator means by an
+     * absent cursor.
+     */
+    public function setTableCursor(?string $cursor = null): void
+    {
+        $this->tableState->set('pagination.cursor', $cursor);
+
+        // Same reasoning as setPage(): the rows on screen are no longer the ones
+        // a selection or a poll checksum was taken against.
+        $this->markTableViewChanged();
+
+        $this->cachedRecords = null;
+    }
+
+    /**
      * Run the table query for the current page, honouring the cache config.
      */
     protected function fetchTableRecords(Table $table): LengthAwarePaginator|Paginator|CursorPaginator|Collection
@@ -897,7 +953,7 @@ trait WithTable
             return $this->paginateQuery($table, $query);
         }
 
-        return $query->get();
+        return $this->readAll($query);
     }
 
     /**
@@ -952,21 +1008,31 @@ trait WithTable
     {
         $perPage = (int) $this->tableState->get('pagination.perPage', 10);
 
-        if ($perPage === Table::PER_PAGE_ALL) {
-            // The sentinel cannot be handed to the paginator: a negative limit
-            // is silently dropped by the query builder (so the rows would be
-            // right) while the paginator still divides the total by it (so the
-            // page count would be negative). Counting first is what makes "all"
-            // one honest page — and max(1) keeps an empty table from dividing
-            // by zero.
-            $perPage = max(1, $query->toBase()->getCountForPagination());
-        }
-
-        return match ($table->getPaginationMode()) {
-            'simple' => $query->simplePaginate($perPage),
-            'cursor' => $query->cursorPaginate($perPage),
-            default => $query->paginate($perPage),
+        // The PER_PAGE_ALL sentinel is resolved by the source, which is where
+        // the count it needs lives; it arrives here as a negative perPage and
+        // leaves as one honest page.
+        $paging = match ($table->getPaginationMode()) {
+            'simple' => PagingRequest::simple($perPage),
+            // The cursor comes from table state rather than the request:
+            // Livewire's pagination is page-based and has no cursor of its own
+            // to read.
+            'cursor' => PagingRequest::cursor($perPage, $this->tableState->get('pagination.cursor')),
+            default => PagingRequest::lengthAware($perPage),
         };
+
+        // Built over this query — already searched, filtered and sorted — rather
+        // than the table's own source, which wraps the base query. Same reason
+        // the poll token is: what gets paged is this set, not the table's.
+        $source = new EloquentDataSource($query);
+
+        // The plan the query was built from, so a source that has to honour it
+        // itself can. EloquentDataSource does not need it — this query is
+        // already narrowed — but the contract is the same for every source, and
+        // handing it an empty plan would be a lie about what was asked for.
+        return $source->paginate(
+            $this->getQueryService()->getLastPlan() ?? new QueryPlan,
+            $paging,
+        );
     }
 
     /**
@@ -988,13 +1054,35 @@ trait WithTable
             app(WriteGeneration::class)->current($this->queryCacheScope($table)),
         );
 
+        // The cache sits *above* the source, not inside it. What makes an entry
+        // stale here is the write generation and the table's own view state —
+        // facts about this host, not about the dataset — so a source that knew
+        // how to cache would be caching the wrong thing.
         return Cache::remember($key, $ttl, function () use ($table, $query) {
             if ($table->isPaginated()) {
                 return $this->paginateQuery($table, $query);
             }
 
-            return $query->get();
+            return $this->readAll($query);
         });
+    }
+
+    /**
+     * Every matching row, unpaginated — the "no pagination" table and the
+     * cached form of it.
+     *
+     * Goes through the source for the same reason paging does: one owner for
+     * how rows are read, so a custom source is asked here too rather than only
+     * on the paged path.
+     *
+     * @param  Builder<Model>  $query
+     * @return Collection<int, mixed>
+     */
+    protected function readAll(Builder $query): Collection
+    {
+        return (new EloquentDataSource($query))->get(
+            $this->getQueryService()->getLastPlan() ?? new QueryPlan,
+        );
     }
 
     /**
@@ -1177,77 +1265,27 @@ trait WithTable
         $sortDirection = $this->tableState->get('sort.direction', '') ?: ($table->getDefaultSortDirection() ?? 'asc');
         $columnFilters = $this->tableState->get('columnFilters', []);
 
-        // Dispatch search event
-        if ($search) {
-            $searchableColumns = [];
-            foreach ($table->getColumns() as $col) {
-                if ($col->isSearchable()) {
-                    $searchableColumns[] = $col->getName();
-                }
-            }
-            event(new TableSearching($tableId, $search, $searchableColumns));
-        }
-
-        // Dispatch filter event
-        $activeFilters = array_filter($filters, fn ($v) => $v !== null && $v !== '' && $v !== []);
-        if (! empty($activeFilters)) {
-            event(new TableFiltering($tableId, $activeFilters));
-        }
-
-        $query = $this->getQueryService()->buildQuery(
-            baseQuery: $baseQuery,
-            table: $table,
-            search: $search,
-            filterValues: $filters,
-            sortColumn: ! empty($sortColumn) ? $sortColumn : null,
-            sortDirection: $sortDirection,
-            columnFilterValues: $columnFilters,
+        // The four search/filter events bracket the build, so their two halves
+        // cannot come apart — see TableQueryEvents.
+        $query = app(TableQueryEvents::class)->around(
+            $tableId,
+            $table,
+            $search,
+            $filters,
+            fn (): Builder => $this->getQueryService()->buildQuery(
+                baseQuery: $baseQuery,
+                table: $table,
+                search: $search,
+                filterValues: $filters,
+                sortColumn: ! empty($sortColumn) ? $sortColumn : null,
+                sortDirection: $sortDirection,
+                columnFilterValues: $columnFilters,
+            ),
         );
-
-        // Post-search event
-        if ($search) {
-            // Count is deferred — we dispatch with -1 as a signal that count is not yet known
-            event(new TableSearched($tableId, $search, -1));
-        }
-
-        // Post-filter event
-        if (! empty($activeFilters)) {
-            event(new TableFiltered($tableId, $activeFilters, -1));
-        }
 
         $query = $this->applyGroupOrdering($query);
 
         $this->cachedQuery = $query;
-
-        return $query;
-    }
-
-    /**
-     * Keep groups contiguous: prepend an order on the group column so every
-     * other sort applies within a group. Skipped when the user explicitly
-     * sorts by the group column — that sort already keeps groups together.
-     *
-     * @param  Builder<Model>  $query
-     * @return Builder<Model>
-     */
-    protected function applyGroupOrdering(Builder $query): Builder
-    {
-        $table = $this->getTable();
-        $groupColumn = $table->getGroupColumn();
-
-        if ($groupColumn === null) {
-            return $query;
-        }
-
-        if ($this->tableState->get('sort.column', '') === $groupColumn) {
-            return $query;
-        }
-
-        $base = $query->getQuery();
-        $base->orders = array_merge(
-            [['column' => $query->qualifyColumn($groupColumn), 'direction' => 'asc']],
-            $base->orders ?? [],
-        );
 
         return $query;
     }
@@ -1421,57 +1459,59 @@ trait WithTable
      */
     public function computeTableSummaries(string $scope = 'query', mixed $parentRecord = null, ?Collection $subRecords = null): array
     {
-        $table = $this->getTable();
-
-        // For sub-rows scope, use sub-row records
-        if ($scope === 'subRows' && $parentRecord !== null && $table->hasSubRows()) {
-            // Reuse already-fetched sub-rows when provided; only query otherwise.
-            $subRecords ??= $this->getSubRows($parentRecord);
-            $columnsToSummarize = $table->getSubRowColumns();
-
-            $summaries = [];
-            foreach ($columnsToSummarize as $column) {
-                if ($column->hasSummary()) {
-                    $summaries[$column->getName()] = $column->computeSummaries($subRecords, null);
-                }
-            }
-
-            return $summaries;
+        // The desktop `<tfoot>` and the mobile card footer are two renderings of
+        // one set of totals in the same document — both halves are always in it,
+        // only CSS decides which is shown — so this ran the whole aggregate batch
+        // twice per render of a stacked table, producing byte-identical SQL. The
+        // memo is per render, so the second reading is free.
+        //
+        // Only the main-table scopes are memoised. The sub-rows scope is asked per
+        // parent record and has no single answer to remember.
+        if ($parentRecord === null && $subRecords === null) {
+            return $this->summaryMemo[$scope] ??= $this->resolveTableSummaries($scope);
         }
 
-        // For main table — resolve the in-memory record set per scope.
-        // The page scope is unwrapped: getTableRecords() hands back a paginator
-        // whenever the table is paginated, and computeSummaries() takes a
-        // Collection — so "this page" was a TypeError on every paginated table,
-        // hidden only because summaries are usually exercised unpaginated.
+        return $this->resolveTableSummaries($scope, $parentRecord, $subRecords);
+    }
+
+    /**
+     * @param  Collection<int, mixed>|null  $subRecords
+     * @return array<string, array<int, array<string, mixed>>>
+     */
+    private function resolveTableSummaries(string $scope, mixed $parentRecord = null, ?Collection $subRecords = null): array
+    {
+        $table = $this->getTable();
+        $set = app(SummarySet::class);
+
+        // Sub-rows summarise a parent's children, over the sub-row columns.
+        // Already-fetched children are reused; only an unprovided set queries.
+        if ($scope === 'subRows' && $parentRecord !== null && $table->hasSubRows()) {
+            return $set->build(
+                $table->getSubRowColumns(),
+                $subRecords ?? $this->getSubRows($parentRecord),
+            );
+        }
+
+        // What a scope *means* is the host's to answer — only it knows which
+        // rows are on the page and which are selected. The page scope is
+        // unwrapped: getTableRecords() hands back a paginator whenever the table
+        // is paginated, and the summaries take a Collection, so "this page" was
+        // a TypeError on every paginated table — hidden only because summaries
+        // are usually exercised unpaginated.
         $pageRecords = $this->getTableRecords();
 
-        $inMemoryRecords = match ($scope) {
+        $records = match ($scope) {
             'page' => $pageRecords instanceof Collection ? $pageRecords : collect($pageRecords->items()),
             'selection' => $this->getSelectedRecords(),
             default => collect(),
         };
-        $query = ($scope === 'query') ? $this->buildTableQuery() : null;
 
-        $columns = $table->getColumns();
-        $summaries = [];
-
-        // Batch all SQL-native query-scope aggregates into at most two queries
-        // instead of one query per summary per column on every render.
-        $batched = $query !== null ? app(SummaryBatch::class)->compute($columns, $query) : [];
-
-        foreach ($columns as $column) {
-            if ($column->hasSummary()) {
-                $summaries[$column->getName()] = $column->computeSummaries(
-                    $inMemoryRecords,
-                    $query,
-                    null,
-                    $batched[$column->getName()] ?? [],
-                );
-            }
-        }
-
-        return $summaries;
+        return $set->build(
+            $table->getColumns(),
+            $records,
+            // Only the query scope hands the batcher something to batch.
+            $scope === 'query' ? $this->buildTableQuery() : null,
+        );
     }
 
     /**
@@ -1488,112 +1528,6 @@ trait WithTable
         }
 
         return $this->tableHasSubRowGrandTotals();
-    }
-
-    /**
-     * Whether group subtotal rows should render: grouping is active, enabled,
-     * and at least one column has a summary to subtotal.
-     */
-    public function tableHasGroupSummaries(): bool
-    {
-        $table = $this->getTable();
-
-        if (! $table->hasGrouping() || ! $table->hasGroupSummaries()) {
-            return false;
-        }
-
-        foreach ($table->getColumns() as $column) {
-            if ($column->hasSummary()) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    /**
-     * Per-group subtotals, computed in memory over the group's records on the
-     * current page (groups crossing a page boundary subtotal per page).
-     *
-     * @return array<string, array<int, array<string, mixed>>> [columnName => [['label' => …, 'value' => …], …]]
-     */
-    public function computeGroupSummaries(mixed $groupValue): array
-    {
-        $table = $this->getTable();
-
-        if (! $table->hasGrouping()) {
-            return [];
-        }
-
-        $groupRecords = $this->getGroupRecords($groupValue);
-
-        $summaries = [];
-
-        foreach ($table->getColumns() as $column) {
-            if (! $column->hasSummary()) {
-                continue;
-            }
-
-            // In-memory over the group's rows; selection/subRows scopes don't
-            // describe a group, so only query/page declarations subtotal.
-            $summaries[$column->getName()] = $column->computeSummaries(
-                $groupRecords,
-                null,
-                ['query', 'page'],
-            );
-        }
-
-        return $summaries;
-    }
-
-    /**
-     * Records of one group on the current page. The page is partitioned once
-     * per request — group subtotals are rendered per group, and re-filtering
-     * the whole page for each of them is O(groups × page size).
-     *
-     * @return Collection<int, Model>
-     */
-    protected function getGroupRecords(mixed $groupValue): Collection
-    {
-        if ($this->cachedGroupPartitions === null) {
-            $table = $this->getTable();
-            $records = $this->getTableRecords();
-            $records = $records instanceof Collection ? $records : collect($records->items());
-
-            $partitions = [];
-
-            foreach ($records as $record) {
-                // Normalised scalar key: the raw value may be a date/object cast
-                // (a fresh Carbon per record), so a strict compare of the raw value
-                // would never match and every row would form its own group. The
-                // caller (computeGroupSummaries) is handed the same key by the view.
-                $value = $table->getGroupComparisonKey($record);
-                $matched = false;
-
-                // 'records' is a Collection object, push() mutates it in place.
-                foreach ($partitions as $partition) {
-                    if ($partition['value'] === $value) {
-                        $partition['records']->push($record);
-                        $matched = true;
-                        break;
-                    }
-                }
-
-                if (! $matched) {
-                    $partitions[] = ['value' => $value, 'records' => collect([$record])];
-                }
-            }
-
-            $this->cachedGroupPartitions = $partitions;
-        }
-
-        foreach ($this->cachedGroupPartitions as $partition) {
-            if ($partition['value'] === $groupValue) {
-                return $partition['records'];
-            }
-        }
-
-        return collect();
     }
 
     /**
@@ -1630,6 +1564,16 @@ trait WithTable
      * @return array<string, array<int, array<string, mixed>>> [columnName => [['label' => …, 'value' => …], …]]
      */
     public function computeSubRowGrandTotals(string $scope = 'query'): array
+    {
+        // Asked once for the desktop footer and once for the mobile one, same as
+        // the column totals above.
+        return $this->subRowGrandTotalMemo[$scope] ??= $this->resolveSubRowGrandTotals($scope);
+    }
+
+    /**
+     * @return array<string, array<int, array<string, mixed>>>
+     */
+    private function resolveSubRowGrandTotals(string $scope): array
     {
         if (! $this->tableHasSubRowGrandTotals()) {
             return [];
@@ -1675,26 +1619,15 @@ trait WithTable
     protected function buildSubRowGrandTotalQuery(string $scope = 'query'): ?Builder
     {
         $table = $this->getTable();
-        $relationName = $table->getSubRowRelation();
+        $relation = app(SubRowQuery::class)->open($table);
 
-        if ($relationName === null) {
+        if ($relation === null) {
             return null;
         }
 
-        $relation = $table->getQuery()->getModel()->{$relationName}();
-
-        if (! $relation instanceof HasOneOrMany) {
-            return null;
-        }
-
-        $childQuery = $relation->getRelated()->newQuery();
-
-        if ($relation instanceof MorphOneOrMany) {
-            $childQuery->where($relation->getQualifiedMorphType(), $relation->getMorphClass());
-        }
-
-        $foreignKey = $relation->getQualifiedForeignKeyName();
-        $localKey = $relation->getLocalKeyName();
+        $childQuery = $relation->children;
+        $foreignKey = $relation->foreignKey;
+        $localKey = $relation->localKey;
 
         if ($scope === 'page') {
             // Paginators forward collection calls, so pluck() works on both.
@@ -1834,6 +1767,132 @@ trait WithTable
     }
 
     /**
+     * Collapse a group, or open it again.
+     *
+     * Keyed by the group's comparison value rather than by the rows in it, so a
+     * group stays collapsed when its contents change — a filter that swaps every
+     * row in "Overdue" leaves "Overdue" collapsed, which is what the user asked
+     * for.
+     */
+    public function toggleGroup(string $group): void
+    {
+        if (! $this->getTable()->hasCollapsibleGroups()) {
+            return;
+        }
+
+        $collapsed = (array) $this->tableState->get('rows.collapsedGroups', []);
+
+        $this->tableState->set(
+            'rows.collapsedGroups',
+            in_array($group, $collapsed, true)
+                ? array_values(array_diff($collapsed, [$group]))
+                : [...$collapsed, $group],
+        );
+
+        $this->markTableViewChanged();
+    }
+
+    /**
+     * Whether this group's rows are hidden.
+     *
+     * Read by the row loop, so it is asked once per row rather than per group —
+     * hence the plain in_array over a list that is at most the number of groups
+     * a user has clicked.
+     */
+    public function isGroupCollapsed(string $group): bool
+    {
+        return in_array($group, (array) $this->tableState->get('rows.collapsedGroups', []), true);
+    }
+
+    // ==========================================
+    // Saved views
+    // ==========================================
+
+    /**
+     * Save the current view under a name, replacing one of the same name.
+     *
+     * A Livewire endpoint, so the body lives in
+     * {@see TableViewPayload}: what a view is
+     * has to be one answer shared with {@see applyTableView()}, or a view would
+     * restore something other than what was saved.
+     */
+    public function saveTableView(string $name): void
+    {
+        $name = trim($name);
+        $key = $this->getTable()->getSavedViewsKey();
+
+        // An empty name is the unnamed current layout, which is not a saved view
+        // — accepting it here would let "Save" overwrite the live layout with
+        // itself and put an entry with no label in the switcher.
+        if ($key === null || $name === '') {
+            return;
+        }
+
+        $this->resolvePreferenceDriver($this->getTable())->save(
+            $key,
+            $this->preferenceUser(),
+            TableViewPayload::capture($this->tableState),
+            $name,
+        );
+    }
+
+    /**
+     * Restore a saved view onto the current table state.
+     */
+    public function applyTableView(string $name): void
+    {
+        $table = $this->getTable();
+        $key = $table->getSavedViewsKey();
+
+        if ($key === null || $name === '') {
+            return;
+        }
+
+        $payload = $this->resolvePreferenceDriver($table)->load($key, $this->preferenceUser(), $name);
+
+        if ($payload === []) {
+            return;
+        }
+
+        TableViewPayload::applyTo($payload, $this->tableState, $table);
+
+        // A restored view changes which records are on screen, so the page it
+        // was saved on is not this view's page any more.
+        $this->resetPage();
+        $this->markTableViewChanged();
+    }
+
+    /**
+     * Delete a saved view. The current layout is untouched.
+     */
+    public function deleteTableView(string $name): void
+    {
+        $key = $this->getTable()->getSavedViewsKey();
+
+        if ($key === null || $name === '') {
+            return;
+        }
+
+        $this->resolvePreferenceDriver($this->getTable())->forget($key, $this->preferenceUser(), $name);
+    }
+
+    /**
+     * The names of this user's saved views, for the switcher.
+     *
+     * @return array<int, string>
+     */
+    public function getTableViews(): array
+    {
+        $key = $this->getTable()->getSavedViewsKey();
+
+        if ($key === null) {
+            return [];
+        }
+
+        return $this->resolvePreferenceDriver($this->getTable())->views($key, $this->preferenceUser());
+    }
+
+    /**
      * Seed the per-user view layout from the saved preference, if the table
      * opted in with rememberColumns() and something has actually been stored.
      *
@@ -1907,7 +1966,7 @@ trait WithTable
      * Resolve the preference driver for this table (per-table override > global
      * config), picking the guest driver when no user is authenticated.
      */
-    protected function resolvePreferenceDriver(Table $table): TablePreferenceDriver
+    protected function resolvePreferenceDriver(Table $table): PreferenceDriver
     {
         return TablePreferenceManager::resolve(
             $table->getPreferenceDriver(),
@@ -1936,30 +1995,14 @@ trait WithTable
     }
 
     /**
-     * Get the resolved Form instance for the halt modal.
-     * Re-hydrates from session since it's not serialized between Livewire requests.
+     * Whether a halted action is waiting on the user.
+     *
+     * The seam the shared bridge restores the halt form through — one owner for
+     * "is a halt open", one for "get its form back".
      */
-    public function getHaltModalFormInstance(): ?Form
+    public function isHaltModalVisible(): bool
     {
-        if ($this->haltModalFormInstance !== null) {
-            return $this->haltModalFormInstance;
-        }
-
-        if ($this->tableState->get('modal.halt.show') && session()->has('wire.halt_form_instance')) {
-            try {
-                $restored = unserialize(session()->get('wire.halt_form_instance'));
-                if ($restored instanceof Form) {
-                    $restored->livewire($this);
-                    $this->haltModalFormInstance = $restored;
-                }
-            } catch (Throwable) {
-                // Corrupt or non-restorable session data — close the modal cleanly
-                $this->tableState->set('modal.halt.show', false);
-                session()->forget('wire.halt_form_instance');
-            }
-        }
-
-        return $this->haltModalFormInstance;
+        return (bool) $this->tableState->get('modal.halt.show');
     }
 
     /**
@@ -1976,46 +2019,74 @@ trait WithTable
 
         $haltConfig = $this->tableState->get('modal.halt.config', []);
 
-        // Validate form if present
-        $validation = $haltConfig['formValidation'] ?? null;
-        if ($validation && ! empty($formData)) {
-            $result = app(ValidationPipeline::class)->validate(
-                $formData,
-                $validation,
-                $haltConfig['formValidationMessages'] ?? [],
-                $haltConfig['formValidationAttributes'] ?? [],
-            );
-
-            if ($result->failed()) {
-                throw ValidationException::withMessages($result->errors());
-            }
-        }
-
-        // Merge form data
-        $data = array_merge($this->tableState->get('modal.halt.formData', []), $formData);
-
         // Capture context before closing
         $actionName = $haltActionName;
         $recordKey = $this->tableState->get('modal.halt.recordKey');
+
+        // The halt form's fields bind to the halt bag, so that bag is its live
+        // state; $formData is the escape hatch for a caller submitting from code.
+        // The old branch here validated $formData alone — and the view submits
+        // with no arguments, so it was never anything but empty: a halt could
+        // declare rules and a required field and neither was ever checked.
+        $haltData = array_merge($this->tableState->get('modal.halt.formData', []), $formData);
+
+        // Throws before anything is executed or closed, leaving the modal open
+        // with its messages on the fields.
+        $this->validateHaltModalForm(
+            $haltData,
+            $haltConfig['formValidation'] ?? [],
+            $haltConfig['formValidationMessages'] ?? [],
+            $haltConfig['formValidationAttributes'] ?? [],
+        );
+
+        // Then let the halt form's fields shape what they collected — the same
+        // transform a save or an action modal applies, so a halted action is
+        // handed the value it would have been handed anywhere else. Read before
+        // closeHaltModal(), which drops the form instance and its parked copy.
+        $data = $this->dehydrateHaltModalFormData($haltData, $this->haltModalRecord($recordKey));
+
         $actionType = $this->tableState->get('modal.halt.actionType') ?? 'row';
         $haltContext = $this->tableState->get('modal.halt.context', []);
         $redirectAfterConfirm = $haltContext['redirectAfterConfirm'] ?? null;
 
         $this->closeHaltModal();
 
-        // Re-execute via correct method based on action type
-        match ($actionType) {
-            'bulk' => $this->executeBulkActionWithData($actionName, $data, confirmed: true),
-            'header' => $this->executeHeaderActionWithData($actionName, $data, confirmed: true),
-            default => $recordKey !== null
-                ? $this->executeTableActionWithData($recordKey, $actionName, $data, confirmed: true)
-                : null,
-        };
+        // Re-execute via correct method based on action type. Wrapped so the
+        // halt's own skipBeforeOnConfirm() decides whether the action's before()
+        // hooks run on this pass — the default skips them, because a halt raised
+        // in a before hook would otherwise raise itself again.
+        $this->withHaltConfirmContext($haltContext, function () use ($actionType, $actionName, $data, $recordKey): void {
+            match ($actionType) {
+                'bulk' => $this->executeBulkActionWithData($actionName, $data, confirmed: true),
+                'header' => $this->executeHeaderActionWithData($actionName, $data, confirmed: true),
+                default => $recordKey !== null
+                    ? $this->executeTableActionWithData($recordKey, $actionName, $data, confirmed: true)
+                    : null,
+            };
+        });
 
         // Redirect after successful confirm
         if ($redirectAfterConfirm) {
             $this->redirect($redirectAfterConfirm);
         }
+    }
+
+    /**
+     * The record a row halt is about, for the fields shaping its data.
+     *
+     * Resolved only when there is a form to shape anything with: a header or
+     * bulk halt has no record, and neither does a confirm that carries no form —
+     * asking the data source for one would be a query bought for nothing.
+     */
+    protected function haltModalRecord(mixed $recordKey): ?Model
+    {
+        if ($recordKey === null || $this->getHaltModalFormInstance() === null) {
+            return null;
+        }
+
+        $record = $this->getTable()->getDataSource()->resolveRecord((string) $recordKey)?->unwrap();
+
+        return $record instanceof Model ? $record : null;
     }
 
     /**
@@ -2029,20 +2100,12 @@ trait WithTable
         $this->tableState->set('modal.halt.config', []);
         $this->tableState->set('modal.halt.formData', []);
         $this->haltModalFormInstance = null;
-        session()->forget('wire.halt_form_instance');
+        $this->forgetHaltForm();
         $this->tableState->set('modal.halt.actionType', null);
         $this->tableState->set('modal.halt.context', []);
 
         // Invalidate table cache so next render fetches fresh data
         $this->invalidateTable();
-    }
-
-    /**
-     * @deprecated Use halt modal system instead. Will be removed in v2.0.
-     */
-    public function confirmBulkAction(string $actionName): void
-    {
-        Deprecation::method('confirmBulkAction', 'executeBulkAction with halt');
     }
 
     /**
@@ -2161,6 +2224,7 @@ trait WithTable
 
             if ($outcome->success) {
                 $this->announceTableWrite();
+                $this->queueRowPartial($recordKey, $columnName);
             }
 
             // The conflict is always shown inline on the cell; a table can opt in
@@ -2175,6 +2239,81 @@ trait WithTable
 
         } catch (Exception $e) {
             return ['success' => false, 'message' => __('wire-table::messages.save_error', ['error' => $e->getMessage()])];
+        }
+    }
+
+    /**
+     * Answer a successful write with the row it changed, if the table asked.
+     *
+     * Opt-in through {@see Table::rowPartials()}, and refused for the three
+     * shapes that keep numbers outside a row — see
+     * {@see Table::usesRowPartials()}. Without it this is a no-op and the write
+     * renders whatever it rendered before.
+     *
+     * Two things have to happen together. The row goes into the partial queue
+     * ({@see InteractsWithPartials}),
+     * and the island render is declined: an editable cell targets the
+     * `data-region` island, and letting both answer would render the region AND
+     * the row — the region would win the morph and the row would be wasted work.
+     *
+     * A record that is no longer on the page renders nothing, which is correct:
+     * the client finds no anchor for it and leaves the page alone.
+     */
+    protected function queueRowPartial(mixed $recordKey, ?string $columnName = null): void
+    {
+        $table = $this->getTable();
+
+        if (! $table->usesRowPartials() || ! method_exists($this, 'renderPartial')) {
+            return;
+        }
+
+        // Editing the column a table groups BY moves the record to another group:
+        // the page's shape changes, and no set of regions can describe that.
+        if ($columnName !== null && $table->getGroupColumn() === $columnName) {
+            return;
+        }
+
+        $records = $this->getTableRecords();
+        $key = $table->getPrimaryKey();
+
+        foreach ($records as $index => $record) {
+            if ((string) $record->{$key} !== (string) $recordKey) {
+                continue;
+            }
+
+            $renderer = RowRenderer::for($table, $this, $this->tableRenderPlan());
+
+            // This used to call `skipIslandsRender()` so the partials answered the
+            // write instead of the island the cell's own `$wire.$island('data-region')`
+            // targets. Livewire removed that switch in v4.4.1 and left no
+            // replacement: `#[Renderless]` is the only remaining way to stop an
+            // implicit island render, and it skips the whole render with it —
+            // which this path cannot have, because a write that moves a record
+            // between groups needs one.
+            //
+            // Nothing is put in its place here. `forceRender()` looks like the
+            // port and is not: it would only un-skip a render `PartialRenderHook`
+            // skips again by writing the store key directly, while blocking the
+            // deliberate skip in `skipTableRenderAfterWrite()` above. The cost of
+            // the loss is real but is not this method's to pay — the island a
+            // cell targets is chosen in the cell's own view, which is where the
+            // table already knows whether partials will answer instead.
+            $this->renderPartial(
+                'row-'.$recordKey,
+                fn (): string => $renderer->render($record, (int) $index),
+            );
+
+            // The one row is rendered here rather than through TablePartials
+            // because its position is known already; everything the write moves
+            // *around* it goes through the same owner as the poll path.
+            $satellites = TablePartials::for($table, $this, $this->tableRenderPlan())
+                ->satellites([$recordKey => $record]);
+
+            foreach ($satellites as $name => $html) {
+                $this->renderPartial($name, $html);
+            }
+
+            return;
         }
     }
 
@@ -2197,55 +2336,15 @@ trait WithTable
             return ['valid' => false, 'errors' => [__('wire-table::messages.column_not_found')]];
         }
 
-        $record = $table->getQuery()->find($recordKey);
+        $record = $table->getDataSource()->resolveRecord($recordKey)?->unwrap();
 
         if (! $record) {
             return ['valid' => false, 'errors' => [__('wire-table::messages.record_not_found')]];
         }
 
-        // Apply the column's own dehydration before validating, so rules see the
-        // value that would actually be stored.
-        if ($column instanceof DehydratesState) {
-            $value = $column->dehydrateState($value, $record);
-        }
-
-        // Use column's validate method (for TextInputColumn)
-        if (method_exists($column, 'validate')) {
-            return $column->validate($value, $record);
-        }
-
-        // Validate using editable rules
-        $rules = $column->getEditableRules($record);
-        if (! empty($rules)) {
-            $validationResult = app(ValidationPipeline::class)->validate(
-                [$columnName => $value],
-                [$columnName => $rules],
-            );
-
-            if ($validationResult->failed()) {
-                return [
-                    'valid' => false,
-                    'errors' => $validationResult->getError($columnName) ?? [],
-                ];
-            }
-        }
-
-        return ['valid' => true, 'errors' => []];
-    }
-
-    /**
-     * @deprecated Use halt modal system instead. Will be removed in v2.0.
-     */
-    public function getConfirmationModalData(): array
-    {
-        Deprecation::method('getConfirmationModalData', 'getHaltModalData');
-
-        return [
-            'title' => __('wire-table::messages.confirm_heading'),
-            'description' => __('wire-table::messages.confirm_description'),
-            'confirmLabel' => __('wire-table::messages.confirm_submit'),
-            'cancelLabel' => __('wire-table::messages.confirm_cancel'),
-        ];
+        // Dehydration and the rules live with the commit path, so this check and
+        // the save it predicts cannot drift apart.
+        return app(CellEditPipeline::class)->validateAgainstRecord($column, $columnName, $value, $record);
     }
 
     // ==========================================
@@ -2388,7 +2487,6 @@ trait WithTable
         // cachedQuery is intentionally kept — the query plan doesn't change,
         // only the row data; re-running the planner would be wasted work.
         $this->cachedRecords = null;
-        $this->cachedGroupPartitions = null;
     }
 
     // ==========================================
@@ -2402,7 +2500,25 @@ trait WithTable
      */
     public function exportTable(string $format = 'csv'): StreamedResponse
     {
-        $exportFormat = ExportFormat::from($format);
+        [$export, $query, $columns] = $this->buildTableExport(ExportFormat::from($format));
+
+        return $export->download($query, $columns);
+    }
+
+    /**
+     * The export this table would produce: its config, its filtered query and
+     * its visible columns.
+     *
+     * Public and separate because a queued export needs exactly this and cannot
+     * get it from a response. {@see RunExportJob}
+     * rebuilds the host and calls it, so a download and a queued file are the
+     * same export delivered two ways rather than two exports that happen to
+     * agree today.
+     *
+     * @return array{0: TableExport, 1: Builder<Model>, 2: array<int, Column>}
+     */
+    public function buildTableExport(ExportFormat $format): array
+    {
         $table = $this->getTable();
 
         // Find ExportAction config if defined
@@ -2414,7 +2530,7 @@ trait WithTable
             }
         }
 
-        $export = ($exportConfig ?? TableExport::make())->format($exportFormat);
+        $export = ($exportConfig ?? TableExport::make())->format($format);
 
         // Use current filtered query
         $query = $this->getFilteredTableQuery();
@@ -2425,7 +2541,69 @@ trait WithTable
             fn (Column $col) => $col->canView() && ! in_array($col->getName(), $this->tableState->get('columns.hidden', []), true),
         ));
 
-        return $export->download($query, $columns);
+        // Here, and therefore once for both deliveries. A hook on `exportTable()`
+        // would leave `queueTableExport()` uncovered, and the two would produce
+        // different files for the same table — which nobody would see until they
+        // compared a download against the queued copy.
+        //
+        // After the visibility filter on purpose: what a callback receives is
+        // what the file would contain, not everything the table declares.
+        $payload = HookDispatch::typed(Hook::ExportConfiguring, fn () => new ExportConfiguringPayload(
+            export: $export,
+            query: $query,
+            columns: $columns,
+            target: HookTarget::for('export', $this, $table->getModelClass()),
+        ));
+
+        if ($payload !== null) {
+            /** @var Builder<Model> $query */
+            $query = $payload->query;
+
+            /** @var array<int, Column> $columns */
+            $columns = $payload->columns;
+        }
+
+        return [$export, $query, $columns];
+    }
+
+    /**
+     * Hand the export to a worker instead of streaming it now.
+     *
+     * For the case a download cannot serve: an export whose query would outlast
+     * the request. The file lands on a disk and a notification says where —
+     * which needs a notification that survives the request, hence the database
+     * driver.
+     */
+    public function queueTableExport(string $format = 'csv', ?string $disk = null, string $directory = 'exports'): void
+    {
+        // The state travels with it: without that the worker mounts fresh and a
+        // user who filtered to twenty rows would receive all ten thousand.
+        RunExportJob::dispatch(static::class, $format, $disk, $directory, $this->tableState->all());
+
+        $this->sendNotification(Notification::info(
+            Trans::get('wire-table::messages.export_queued')
+        ));
+    }
+
+    /**
+     * Hand an uploaded file to a worker and return immediately.
+     *
+     * Takes a **disk path**, not the temp upload's real path: the worker may be
+     * another machine, and a Livewire temp file will not be there when it looks.
+     * Store the upload first — `$file->store('imports')` — and pass what that
+     * returns.
+     *
+     * The import itself is unchanged; see
+     * {@see RunImportJob} for why this needed
+     * no second copy of anything, unlike the export.
+     */
+    public function queueTableImport(string $path, ?string $disk = null): void
+    {
+        RunImportJob::dispatch(static::class, $path, $disk);
+
+        $this->sendNotification(Notification::info(
+            Trans::get('wire-table::messages.import_queued')
+        ));
     }
 
     /**
@@ -2438,8 +2616,10 @@ trait WithTable
      */
     public function importTable(string $filePath): ImportResult
     {
+        $table = $this->getTable();
+
         $importAction = null;
-        foreach ($this->getTable()->getHeaderActions() as $action) {
+        foreach ($table->getHeaderActions() as $action) {
             if ($action instanceof ImportAction) {
                 $importAction = $action;
                 break;
@@ -2454,12 +2634,34 @@ trait WithTable
             return new ImportResult;
         }
 
-        $result = ($importAction?->getImportConfig() ?? TableImport::make())->import($filePath);
+        $import = $importAction?->getImportConfig() ?? TableImport::make();
+
+        // The other half of `export.configuring`, and it costs one dispatch
+        // rather than a composition point: a queued import re-enters through this
+        // very method (`RunImportJob` mounts the host and calls it), so streamed
+        // and queued are already one path.
+        //
+        // After the authorization check above, never before — the path a callback
+        // can read is one the action has already agreed to open.
+        $payload = HookDispatch::typed(Hook::ImportConfiguring, fn () => new ImportConfiguringPayload(
+            import: $import,
+            columns: $import->getColumns(),
+            path: $filePath,
+            target: HookTarget::for('import', $this, $table->getModelClass()),
+        ));
+
+        if ($payload !== null) {
+            /** @var array<int, ImportColumn> $columns */
+            $columns = $payload->columns;
+
+            $import->columns($columns);
+        }
+
+        $result = $import->import($filePath);
 
         // New rows changed the dataset — drop cached records/partitions so the
         // next render reflects the import.
         $this->cachedRecords = null;
-        $this->cachedGroupPartitions = null;
 
         return $result;
     }

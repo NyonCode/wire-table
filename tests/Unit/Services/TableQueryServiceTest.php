@@ -11,12 +11,15 @@ use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Database\Eloquent\Relations\HasOneThrough;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
+use NyonCode\WireCore\Core\Plugin\Contracts\IdentifiesHookTarget;
+use NyonCode\WireCore\Core\Plugin\Hooks\TableConfiguringPayload;
 use NyonCode\WireCore\Core\Plugin\PluginManager;
 use NyonCode\WireCore\Core\Query\Contracts\QueryPipe;
 use NyonCode\WireCore\Core\Query\QueryPlan;
 use NyonCode\WireSortable\SortablePlugin;
 use NyonCode\WireSortable\SortableTable;
 use NyonCode\WireTable\Columns\Column;
+use NyonCode\WireTable\Columns\SplitColumn;
 use NyonCode\WireTable\Filters\Filter;
 use NyonCode\WireTable\Filters\SelectFilter;
 use NyonCode\WireTable\Services\TableQueryService;
@@ -43,6 +46,15 @@ class TqsUser extends Model
     public function profile(): HasOne
     {
         return $this->hasOne(TqsProfile::class, 'user_id');
+    }
+}
+
+/** A host that shows a registered entry, the way a resource page does. */
+class TqsHostComponent implements IdentifiesHookTarget
+{
+    public function hookKey(): ?string
+    {
+        return 'tqs-users';
     }
 }
 
@@ -701,6 +713,60 @@ it('filters by a hasMany relation column, which a join could not express', funct
     expect($query->get()->pluck('name')->all())->toBe(['Bob']);
 });
 
+// A composite column is registered under a name for the group it draws, not an
+// attribute — so the name the header is clicked under and the attribute the
+// query must order by are two different strings. Before the seam asked
+// getSortColumn(), it ordered by the group's name and SQLite answered
+// "no such column: tqs_users.identity".
+it('sorts a split column by its first sortable child, not by its own name', function () {
+    $table = Table::make()
+        ->model(TqsUser::class)
+        ->columns([
+            SplitColumn::split([
+                Column::make('name')->sortable(),
+                Column::make('email'),
+            ], 'identity'),
+        ]);
+
+    $service = new TableQueryService;
+    $query = $service->buildQuery(
+        baseQuery: TqsUser::query(),
+        table: $table,
+        sortColumn: 'identity',
+        sortDirection: 'desc',
+    );
+
+    // Through the same unquoting every other SQL assertion here goes through:
+    // MySQL and MariaDB quote an identifier in backticks, so a double-quoted
+    // expectation is a test about one grammar rather than about the ordering.
+    expect(tqsUnquoted($query->toSql()))->toContain('order by tqs_users.name desc')
+        ->and($query->toSql())->not->toContain('identity');
+
+    $results = $query->get();
+    expect($results->first()->name)->toBe('Charlie')
+        ->and($results->last()->name)->toBe('Alice');
+});
+
+it('sorts a split column by its own name when no child is sortable', function () {
+    $table = Table::make()
+        ->model(TqsUser::class)
+        ->columns([
+            SplitColumn::split([
+                Column::make('email'),
+            ], 'name')->sortable(),
+        ]);
+
+    $service = new TableQueryService;
+    $query = $service->buildQuery(
+        baseQuery: TqsUser::query(),
+        table: $table,
+        sortColumn: 'name',
+        sortDirection: 'asc',
+    );
+
+    expect($query->get()->first()->name)->toBe('Alice');
+});
+
 it('ignores sort for non-sortable columns', function () {
     $table = Table::make()
         ->model(TqsUser::class)
@@ -747,6 +813,64 @@ it('lets table.configuring hooks modify columns before planning', function () {
     expect($results)->toHaveCount(1)
         ->and($results->first()->name)->toBe('Alice')
         ->and($service->getLastPlan()?->hasSearch())->toBeTrue();
+});
+
+it('scopes a table hook to one table, by model and by host', function () {
+    // Before the payload carried a target, every callback ran for every table in
+    // the application and the author wrote this guard by hand, once per installed
+    // module, against untyped objects.
+    $manager = app(PluginManager::class);
+    $ran = [];
+
+    $manager->hook('table.configuring', function (array $payload) use (&$ran): array {
+        $ran[] = 'by-model';
+
+        return $payload;
+    }, for: TqsUser::class);
+
+    $manager->hook('table.configuring', function (array $payload) use (&$ran): array {
+        $ran[] = 'by-host';
+
+        return $payload;
+    }, for: TqsHostComponent::class);
+
+    $manager->hook('table.configuring', function (array $payload) use (&$ran): array {
+        $ran[] = 'elsewhere';
+
+        return $payload;
+    }, for: 'invoices');
+
+    $table = Table::make()
+        ->model(TqsUser::class)
+        ->livewireComponent(new TqsHostComponent)
+        ->columns([Column::make('name')]);
+
+    (new TableQueryService)->buildQuery(baseQuery: TqsUser::query(), table: $table);
+
+    expect($ran)->toBe(['by-model', 'by-host']);
+});
+
+it('hands a typed table hook the component the table renders in', function () {
+    $manager = app(PluginManager::class);
+    $seen = null;
+
+    $manager->hook('table.configuring', function (TableConfiguringPayload $payload) use (&$seen) {
+        $seen = $payload->target;
+
+        return $payload;
+    });
+
+    $table = Table::make()
+        ->model(TqsUser::class)
+        ->livewireComponent(new TqsHostComponent)
+        ->columns([Column::make('name')]);
+
+    (new TableQueryService)->buildQuery(baseQuery: TqsUser::query(), table: $table);
+
+    expect($seen?->surface)->toBe('table')
+        ->and($seen?->model)->toBe(TqsUser::class)
+        ->and($seen?->host)->toBeInstanceOf(TqsHostComponent::class)
+        ->and($seen?->key)->toBe('tqs-users');
 });
 
 it('lets table.querying hooks force sort before the query is planned', function () {
@@ -836,7 +960,13 @@ it('dispatches table.queried hooks with the built query and plan', function () {
 });
 
 it('uses SortablePlugin force sort overrides while a table is reordering', function () {
-    $manager = app(PluginManager::class);
+    // A *fresh* manager: the application's own has booted by the time a test
+    // body runs, and registering into a booted manager is refused — a plugin
+    // arriving then is never booted and its declarations reach no registry.
+    // Binding a new one puts this back in the phase a package provider
+    // registers from, which is where SortablePlugin really arrives.
+    $manager = new PluginManager;
+    app()->instance(PluginManager::class, $manager);
     $manager->register(new SortablePlugin);
 
     $component = new class

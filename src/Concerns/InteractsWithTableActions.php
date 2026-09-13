@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace NyonCode\WireTable\Concerns;
 
+use Illuminate\Database\Eloquent\Model;
 use NyonCode\WireCore\Actions\Action;
 use NyonCode\WireCore\Actions\ActionGroup;
 use NyonCode\WireCore\Actions\BulkAction;
@@ -167,6 +168,48 @@ trait InteractsWithTableActions
     }
 
     /**
+     * The action a queued job named, looked up the way the host does.
+     *
+     * A public seam over the protected {@see findAction()} rather than widening
+     * that one: the job needs exactly this question answered and nothing else,
+     * and delegating means grouped actions and behaviour-only record actions
+     * stay findable without a second copy of the search drifting from the first.
+     */
+    public function resolveActionByName(string $name): ?Action
+    {
+        return $this->findAction($name);
+    }
+
+    /**
+     * Records for a set of keys — what a queued action resolves them with.
+     *
+     * Fresh from the table's own query rather than carried in the job payload:
+     * a model serialized at dispatch is stale by the time a worker picks it up,
+     * and a bulk action over ten thousand of them would be a megabyte of
+     * payload. The keys travel; the rows are read here.
+     *
+     * Qualified because `getQuery()` may carry a belongs-to join whose table has
+     * its own `id`, exactly as the selection scope has to qualify it.
+     *
+     * @param  array<int, mixed>  $keys
+     * @return array<int, Model>
+     */
+    public function resolveRecordsByKey(array $keys): array
+    {
+        if ($keys === []) {
+            return [];
+        }
+
+        $table = $this->getTable();
+        $query = $table->getQuery();
+
+        return $query
+            ->whereIn($query->getModel()->qualifyColumn($table->getPrimaryKey()), $keys)
+            ->get()
+            ->all();
+    }
+
+    /**
      * Route action notifications through the table's configured driver.
      */
     protected function sendActionNotification(Notification $notification): void
@@ -206,7 +249,10 @@ trait InteractsWithTableActions
         $table = $this->getTable();
         $record = $table->getQuery()->where($table->getPrimaryKey(), $recordKey)->first();
 
-        if (! $record) {
+        // An inactive record whose state withholds its actions refuses the modal
+        // too: the inert action cell is a client fact, and a modal opened from a
+        // forged mount would run the action at the end of it.
+        if (! $record || $table->isRecordActionLocked($record)) {
             return;
         }
 
@@ -291,9 +337,16 @@ trait InteractsWithTableActions
         }
 
         $table = $this->getTable();
-        $record = $table->getQuery()->find($recordKey);
+        // Through the source, and unwrapped straight away: the framework
+        // resolves by contract so a custom source is asked too, and hands
+        // user code a Model, which is what every action closure expects
+        // (ADR 0019 invariant 3, as amended).
+        $record = $table->getDataSource()->resolveRecord($recordKey)?->unwrap();
 
-        if (! $record || ! $action->canExecute($record)) {
+        // The server's half of Support\InactiveRow::actions(false) — see
+        // openActionModal(). A bulk action is deliberately not covered: it acts
+        // on a selection, which is governed by selectable() instead.
+        if (! $record || $table->isRecordActionLocked($record) || ! $action->canExecute($record)) {
             return;
         }
 
@@ -319,7 +372,6 @@ trait InteractsWithTableActions
         $this->cachedQuery = null;
         $this->queryService = null;
         $this->cachedSelectedRecords = null;
-        $this->cachedGroupPartitions = null;
         $this->resolvedActionFrameCache = [];
 
         event(new TableRefreshed(static::class));

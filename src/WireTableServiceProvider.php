@@ -4,8 +4,7 @@ declare(strict_types=1);
 
 namespace NyonCode\WireTable;
 
-use Illuminate\Support\Facades\Route;
-use Livewire\Mechanisms\HandleComponents\HandleComponents;
+use Livewire\LivewireManager;
 use NyonCode\LaravelPackageToolkit\Commands\InstallCommand;
 use NyonCode\LaravelPackageToolkit\Packager;
 use NyonCode\LaravelPackageToolkit\PackageServiceProvider;
@@ -13,7 +12,6 @@ use NyonCode\WireCore\Actions\Action;
 use NyonCode\WireCore\Foundation\Assets\Bundle;
 use NyonCode\WireTable\Livewire\TableStateSynthesizer;
 use NyonCode\WireTable\Support\RecordAction;
-use Symfony\Component\HttpFoundation\BinaryFileResponse;
 
 class WireTableServiceProvider extends PackageServiceProvider
 {
@@ -31,11 +29,18 @@ class WireTableServiceProvider extends PackageServiceProvider
             ->name('WireTable')
             ->hasShortName('wire-table')
             ->bootedPackage(function ($packager) {
-                app(HandleComponents::class)
-                    ->registerPropertySynthesizer(TableStateSynthesizer::class);
+                // The manager, not `app(HandleComponents::class)`: Livewire 4 moved
+                // the synthesizer registry out of that mechanism into
+                // `HandleSynths::registerSynth()`, and `registerPropertySynthesizer()`
+                // no longer exists there. `propertySynthesizer()` is the supported
+                // seam and forwards to the right owner in both 3.x and 4.x. Resolved
+                // from the container rather than through the `Livewire` facade
+                // because the facade's `@method` list does not carry it — same
+                // pattern as core's CurrentComponentDriver.
+                app(LivewireManager::class)->propertySynthesizer(TableStateSynthesizer::class);
 
                 $this->registerRecordActionMacros();
-                $this->registerAssetRoutes();
+                Bundle::serve('wire-table', self::ASSETS_PATH);
             })
             ->hasConfig()
             ->hasViews()
@@ -43,15 +48,31 @@ class WireTableServiceProvider extends PackageServiceProvider
                 Bundle::make('wire-table-records.js'),
                 Bundle::make('wire-table-selection.js'),
                 Bundle::make('wire-table-live.js'),
+                // The Excel-style fill handle. It lived in `wire-core-dropdown.js`
+                // until ADR 0025 § step 10: every wire-core consumer shipped 9 KB of
+                // a gesture only a table can trigger. It ships with the rest rather
+                // than on request — ADR 0024 forbids delivering an interaction
+                // registrar late, and `x-data="wireFillHandle()"` is in the rendered
+                // row region, not behind a click.
+                Bundle::make('wire-table-fill.js'),
             ])
             ->hasAssetFallback(Bundle::servedByRoute('wire-table'))
-            ->hasMigrations()
+            // No `hasMigrations()`: this package has no tables of its own any
+            // more. `table_preferences` was the only one, and it moved to
+            // wire-core as `wire_preferences` when the per-user store came down
+            // to where a dashboard could reach it too. Left declared, the tag
+            // survived over an empty directory and answered a publish with "No
+            // publishable resources" — which reads as a broken install rather
+            // than as a thing that moved.
             ->hasTranslations()
             ->hasAbout()
             ->hasInstallCommand(function (InstallCommand $command) {
                 $command
                     ->publishConfig()
-                    ->publishMigrations()
+                    // No migrations to publish; see `hasMigrations()` above.
+                    // The per-user preference table is wire-core's now, and an
+                    // install that offered to publish nothing would be offering
+                    // the user a decision with no consequence.
                     ->publishViews()
                     ->publishTranslations();
             });
@@ -84,27 +105,6 @@ class WireTableServiceProvider extends PackageServiceProvider
             /** @var Action $this */
             return RecordAction::make($this)->on($type);
         });
-    }
-
-    /**
-     * Serve the package's pre-bundled record-action JS directly so the table view
-     * can inject it via `@assets` without the consumer running npm or publishing
-     * assets. Mirrors the wire-forms delivery.
-     */
-    protected function registerAssetRoutes(): void
-    {
-        Route::get('/wire-table/assets/{asset}.js', function (string $asset): BinaryFileResponse {
-            $file = self::ASSETS_PATH.'/wire-table-'.basename($asset).'.js';
-
-            abort_unless(is_file($file), 404);
-
-            return response()
-                ->file($file, ['Content-Type' => 'application/javascript; charset=utf-8'])
-                ->setPublic()
-                ->setMaxAge(31536000);
-        })
-            ->where('asset', '[A-Za-z0-9_-]+')
-            ->name('wire-table.asset');
     }
 
     /**

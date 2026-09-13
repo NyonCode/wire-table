@@ -39,6 +39,8 @@ it('has correct default values', function () {
         ->and($table->isHoverable())->toBeTrue()
         ->and($table->isCompact())->toBeFalse()
         ->and($table->isBordered())->toBeFalse()
+        ->and($table->hasStickyHeader())->toBeFalse()
+        ->and($table->getStickyHeaderMaxHeight())->toBeNull()
         ->and($table->isLazy())->toBeFalse()
         ->and($table->isPolling())->toBeFalse()
         ->and($table->isStackedOnMobile())->toBeFalse()
@@ -63,6 +65,7 @@ it('supports fluent chaining for all setters', function () {
         ->hoverable(false)
         ->compact()
         ->bordered()
+        ->stickyHeader(maxHeight: '32rem')
         ->lazy()
         ->lazyPlaceholder('Načítání...')
         ->stackedOnMobile(true, 'lg')
@@ -86,6 +89,8 @@ it('supports fluent chaining for all setters', function () {
         ->and($table->isHoverable())->toBeFalse()
         ->and($table->isCompact())->toBeTrue()
         ->and($table->isBordered())->toBeTrue()
+        ->and($table->hasStickyHeader())->toBeTrue()
+        ->and($table->getStickyHeaderMaxHeight())->toBe('32rem')
         ->and($table->isLazy())->toBeTrue()
         ->and($table->getLazyPlaceholder())->toBe('Načítání...')
         ->and($table->isStackedOnMobile())->toBeTrue()
@@ -100,6 +105,17 @@ it('supports fluent chaining for all setters', function () {
         ->and($table->getTableClass())->toBe('custom-table')
         ->and($table->getHeaderClass())->toBe('custom-header')
         ->and($table->getRowClass())->toBe('custom-row');
+});
+
+it('reports no cap on the scroll region once the header stops pinning', function () {
+    // The cap exists only to give the header something to stay behind, so it is
+    // reported through the flag rather than beside it: a table that stops
+    // pinning stops capping, whatever height was named on the way in.
+    $table = Table::make()->stickyHeader(maxHeight: '32rem');
+
+    expect($table->getStickyHeaderMaxHeight())->toBe('32rem')
+        ->and($table->stickyHeader(false)->getStickyHeaderMaxHeight())->toBeNull()
+        ->and($table->hasStickyHeader())->toBeFalse();
 });
 
 it('resolves responsive stacked layout classes from the breakpoint', function () {
@@ -181,6 +197,29 @@ it('counts flattened non-divider actions against the collapse threshold', functi
         ->collapseActionsOnMobile();
 
     expect($below->shouldCollapseActionsOnMobile())->toBeFalse();
+});
+
+it('drops a divider and a record-less member from inside a group as well', function () {
+    // The same two exclusions one level down. A group is free to hold its own
+    // separators and a header action folded into the toolbar's menu; neither is
+    // a row action, so neither counts toward the threshold nor reaches the card.
+    $table = Table::make()
+        ->actions([
+            ActionGroup::make([
+                Action::make('edit'),
+                Action::divider(),
+                HeaderAction::make('import'),
+                Action::make('delete'),
+            ]),
+            Action::make('view'),
+        ])
+        ->collapseActionsOnMobile();
+
+    $names = array_map(fn ($action) => $action->getName(), $table->getMobileActionGroup()->getActions());
+
+    // edit + delete + view = 3, not the five members the group and list declare.
+    expect($names)->toBe(['edit', 'delete', 'view'])
+        ->and($table->shouldCollapseActionsOnMobile())->toBeTrue();
 });
 
 it('is disabled outright when collapse is turned off, regardless of action count', function () {
@@ -539,14 +578,6 @@ it('can enable polling with interval', function () {
     expect($table->isPolling())->toBeTrue()
         ->and($table->getPollingInterval())->toBe('10s');
 });
-
-it('polling alias works', function () {
-    $table = Table::make()->polling('30s');
-
-    expect($table->isPolling())->toBeTrue()
-        ->and($table->getPollingInterval())->toBe('30s');
-});
-
 it('can configure polling options', function () {
     $table = Table::make()
         ->poll('5s')

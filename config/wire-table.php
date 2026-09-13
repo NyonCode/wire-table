@@ -1,9 +1,9 @@
 <?php
 
 declare(strict_types=1);
-use NyonCode\WireTable\Preferences\Drivers\DatabasePreferenceDriver;
-use NyonCode\WireTable\Preferences\Drivers\NullPreferenceDriver;
-use NyonCode\WireTable\Preferences\Drivers\SessionPreferenceDriver;
+use NyonCode\WireCore\Foundation\Preferences\Drivers\DatabasePreferenceDriver;
+use NyonCode\WireCore\Foundation\Preferences\Drivers\NullPreferenceDriver;
+use NyonCode\WireCore\Foundation\Preferences\Drivers\SessionPreferenceDriver;
 
 return [
 
@@ -35,6 +35,27 @@ return [
         | A per-table gestures() always wins over this.
         */
         'gestures' => null,
+
+        /*
+        | What a record marked inactive with Table::rowInactive() looks like and
+        | what it still permits, project-wide. null keeps the shipped defaults:
+        | the row is dimmed but not struck through, carries no tint, and inline
+        | editing is locked (refused server-side too) while its actions, its
+        | checkbox and a record click stay live.
+        |
+        |   'inactive_rows' => [
+        |       'strikethrough' => true,     // strike the row's text
+        |       'dim' => true,               // mute it
+        |       'color' => 'danger',         // tint it through the row-tint owner
+        |       'editing' => false,          // inline editing on an inactive row
+        |       'selectable' => true,        // may it be ticked
+        |       'actions' => true,           // are its row actions operable
+        |   ],
+        |
+        | A per-table rowInactive(..., fn (InactiveRow $row) => ...) always wins
+        | over this.
+        */
+        'inactive_rows' => null,
     ],
 
     /*
@@ -76,8 +97,8 @@ return [
     | Built-in drivers:
     |   - null     : do not persist (column toggles last only for the request)
     |   - session  : store in the session (no migration needed)
-    |   - database : store in the `table_preferences` table (publish + run the
-    |                migration: vendor:publish --tag="wire-table::migrations")
+    |   - database : store in the `wire_preferences` table (publish + run the
+    |                migration: vendor:publish --tag="wire-core::migrations")
     |
     | Point an alias at your own class to use a custom store.
     |

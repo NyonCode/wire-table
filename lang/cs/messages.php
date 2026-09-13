@@ -82,8 +82,13 @@ return [
     'view_options' => 'Zobrazení',
     'columns_section' => 'Sloupce',
     'details_section' => 'Detaily',
+    'views_section' => 'Uložené pohledy',
+    'save_current_view' => 'Uložit aktuální pohled…',
+    'save_view_prompt' => 'Pojmenujte pohled',
+    'delete_view' => 'Smazat pohled',
     'expand_all_rows' => 'Rozbalit u všech řádků',
     'export_label' => 'Export',
+    'import_queued' => 'Import běží na pozadí.',
     'import_label' => 'Import',
     'import_result' => 'Naimportováno :imported řádků, :failed selhalo.',
 
@@ -111,6 +116,7 @@ return [
     'showing' => 'Zobrazuje se',
     'of' => 'z',
     'records' => 'záznamů',
+    'pagination_navigation' => 'Stránkování',
     'pagination_previous' => 'Předchozí stránka',
     'pagination_next' => 'Další stránka',
     'pagination_goto' => 'Přejít na stránku :page',
@@ -165,4 +171,8 @@ return [
     'shortcut_run_action' => 'Spustit „:action“',
     'shortcut_context_menu' => 'Otevřít nabídku řádku',
     'shortcut_show_help' => 'Zobrazit klávesové zkratky',
+
+    // Frontované exporty ({@see Export\Jobs\RunExportJob}).
+    'export_queued' => 'Export se připravuje na pozadí.',
+    'export_ready' => 'Export je hotový: :file',
 ];

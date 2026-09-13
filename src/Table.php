@@ -14,45 +14,46 @@ use Illuminate\Support\Str;
 use Illuminate\Support\Traits\Macroable;
 use NyonCode\WireCore\Actions\Action;
 use NyonCode\WireCore\Actions\ActionGroup;
-use NyonCode\WireCore\Actions\BaseAction;
-use NyonCode\WireCore\Actions\HeaderAction;
 use NyonCode\WireCore\Core\Plugin\PluginManager;
 use NyonCode\WireCore\Core\Query\Search\SearchConfig;
-use NyonCode\WireCore\Core\Support\Deprecation;
 use NyonCode\WireCore\Core\Support\Trans;
 use NyonCode\WireCore\Foundation\Concerns\HasColor;
 use NyonCode\WireCore\Foundation\Concerns\HasSheetOnMobile;
-use NyonCode\WireCore\Foundation\Enums\Alignment;
-use NyonCode\WireCore\Foundation\Enums\Breakpoint;
 use NyonCode\WireCore\Foundation\Icons\Icon;
 use NyonCode\WireCore\Foundation\Icons\IconManager;
+use NyonCode\WireCore\Foundation\Preferences\Contracts\PreferenceDriver;
+use NyonCode\WireCore\Foundation\Support\IslandViewScope;
 use NyonCode\WireCore\Foundation\ValueObjects\ShortcutHint;
 use NyonCode\WireCore\Foundation\View\Skeleton;
 use NyonCode\WireCore\Notifications\Contracts\NotificationDriver;
-use NyonCode\WireTable\Actions\EmptyStateActionClickResolver;
-use NyonCode\WireTable\Actions\RecordActionResolver;
 use NyonCode\WireTable\Actions\TableActionClickResolver;
 use NyonCode\WireTable\Columns\Column;
 use NyonCode\WireTable\Concerns\CanSelectRecords;
 use NyonCode\WireTable\Concerns\HasSqlDebug;
+use NyonCode\WireTable\Concerns\WithTable;
 use NyonCode\WireTable\Exceptions\TableConfigurationException;
+use NyonCode\WireTable\Exceptions\TableHasNoHostException;
+use NyonCode\WireTable\Exceptions\TableIntrospectionException;
 use NyonCode\WireTable\Filters\Filter;
-use NyonCode\WireTable\Preferences\Contracts\TablePreferenceDriver;
+use NyonCode\WireTable\Preferences\TableViewPayload;
 use NyonCode\WireTable\Services\TableIntrospector;
 use NyonCode\WireTable\Support\ColumnSet;
-use NyonCode\WireTable\Support\MobileCard;
-use NyonCode\WireTable\Support\RecordAction;
 use NyonCode\WireTable\Support\TableShortcutLegend;
 
 /** @phpstan-consistent-constructor */
 #[\AllowDynamicProperties]
 class Table implements Htmlable
 {
+    use Concerns\CollapsesActionsOnMobile;
     use Concerns\HasDataSource;
     use Concerns\HasGestures;
     use Concerns\HasGrouping;
+    use Concerns\HasInactiveRecords;
     use Concerns\HasPolling;
+    use Concerns\HasRecordActions;
     use Concerns\HasSubRows;
+    use Concerns\HasTableActions;
+    use Concerns\StacksOnMobile;
     use HasSheetOnMobile;
     use HasSqlDebug;
     use Macroable;
@@ -65,24 +66,27 @@ class Table implements Htmlable
      */
     public const PER_PAGE_ALL = -1;
 
+    /**
+     * How tall the scroll region gets when {@see stickyHeader()} is on and no
+     * height was named. A sticky `<thead>` pins against the nearest scrolling
+     * ancestor, and the table's own wrapper is already one — `overflow-x: auto`
+     * computes `overflow-y: auto` — so without a cap the region never scrolls
+     * vertically and the header has nothing to pin to.
+     */
+    public const DEFAULT_STICKY_MAX_HEIGHT = '70vh';
+
     protected ?ColumnSet $columns = null;
 
     /** @var array<int, Filter> */
     protected array $filters = [];
 
-    /** @var array<int, Action|ActionGroup> */
-    protected array $actions = [];
-
-    /** @var array<int, Action> */
-    protected array $bulkActions = [];
-
-    /** @var array<int, Action> */
-    protected array $headerActions = [];
-
     protected int $perPage = 10;
 
     /** @var array<int, int> */
     protected array $perPageOptions = [10, 25, 50, 100];
+
+    /** Whether the footer draws the page-size control. See {@see perPageSelector()}. */
+    protected bool $showPerPageSelector = true;
 
     protected bool $searchable = true;
 
@@ -98,11 +102,19 @@ class Table implements Htmlable
 
     protected bool $selectable = false;
 
-    /** The selection cell's compiled markup — {@see getSelectionCellSkeleton()}. */
-    protected ?Skeleton $selectionCellSkeleton = null;
+    /**
+     * The selection cell's compiled markup — {@see getSelectionCellSkeleton()} —
+     * keyed by its one shape beyond the record key: live or inert.
+     *
+     * @var array<string, Skeleton>
+     */
+    protected array $selectionCellSkeletons = [];
 
     /** The context-menu panel's compiled markup — {@see getRowContextMenuSkeleton()}. */
     protected ?Skeleton $rowContextMenuSkeleton = null;
+
+    /** The record link's compiled markup — {@see getRecordLinkSkeleton()}. */
+    protected ?Skeleton $recordLinkSkeleton = null;
 
     /**
      * The sub-row expander cell, one compiled shape per state.
@@ -111,8 +123,14 @@ class Table implements Htmlable
      */
     protected array $subRowCellSkeletons = [];
 
-    /** The group header row's compiled markup — {@see getGroupHeaderRow()}. */
-    protected ?Skeleton $groupHeaderSkeleton = null;
+    /**
+     * The group header row's compiled markup, one per shape.
+     *
+     * {@see getGroupHeaderRow()}
+     *
+     * @var array<string, Skeleton>
+     */
+    protected array $groupHeaderSkeletons = [];
 
     // Policy-based authorization
     protected bool $usePolicy = false;
@@ -135,9 +153,6 @@ class Table implements Htmlable
 
     protected ?string $emptyStateIcon = null;
 
-    /** @var array<int, Action|HeaderAction> */
-    protected array $emptyStateActions = [];
-
     protected bool $striped = false;
 
     protected bool $hoverable = true;
@@ -150,22 +165,15 @@ class Table implements Htmlable
 
     protected ?string $primaryKey = 'id';
 
-    // Action positioning
-    protected string $actionsPosition = 'end'; // 'start', 'end'
-
-    protected string $actionsAlignment = 'right'; // 'left', 'center', 'right'
-
-    protected ?string $actionsColumnLabel = null;
-
-    protected ?string $actionsColumnWidth = null;
-
-    /** Row-action presentation: 'solid' (default, filled buttons) or 'quiet' (neutral at rest, color on hover/focus). */
-    protected string $actionsStyle = 'solid';
-
     // Table styling
     protected bool $compact = false;
 
     protected bool $bordered = false;
+
+    protected bool $stickyHeader = false;
+
+    /** @var string A CSS length capping the scroll region {@see stickyHeader()} pins against. */
+    protected string $stickyHeaderMaxHeight = self::DEFAULT_STICKY_MAX_HEIGHT;
 
     protected ?string $tableClass = null;
 
@@ -176,30 +184,6 @@ class Table implements Htmlable
 
     /** @var string|Closure|null Semantic/hue color tint for a whole row; a Closure receives the record. */
     protected string|Closure|null $rowColor = null;
-
-    // Responsive layout
-    protected bool $stackedOnMobile = false;
-
-    /** Explicit stacked-card slot assignment; null derives from the columns. */
-    protected ?Closure $mobileCardCallback = null;
-
-    private ?MobileCard $resolvedMobileCard = null;
-
-    private ?string $resolvedMobileCardSignature = null;
-
-    protected string $stackedBreakpoint = 'md';
-
-    /** Collapse row actions into a single dropdown group in the mobile stacked-card view. */
-    protected bool $collapseActionsOnMobile = false;
-
-    /** Minimum number of row actions before the mobile card collapses them into a dropdown. */
-    protected int $collapseActionsOnMobileThreshold = 3;
-
-    /** Collapse the toolbar's header actions into a single dropdown group on a phone. */
-    protected bool $collapseHeaderActionsOnMobile = false;
-
-    /** Minimum number of header actions before the toolbar collapses them into a dropdown. */
-    protected int $collapseHeaderActionsOnMobileThreshold = 2;
 
     // Lazy loading
     protected bool $lazy = false;
@@ -220,25 +204,15 @@ class Table implements Htmlable
     // Per-user column preferences: stable key (null = disabled) + optional driver.
     protected ?string $rememberColumnsKey = null;
 
-    protected ?TablePreferenceDriver $preferenceDriver = null;
+    /** Saved-views key; null = off, '' = opted in with nothing to key on. */
+    protected ?string $savedViewsKey = null;
+
+    protected ?PreferenceDriver $preferenceDriver = null;
 
     /** @var array<int, Action|ActionGroup> Dedicated actions for the row right-click menu. */
-    protected array $rowContextMenuActions = [];
-
-    /** @var array<int, string|Action|RecordAction> Row-level record-action bindings (click/dblclick/etc.). */
-    protected array $recordActions = [];
-
-    /** Opt-in hover color for rows carrying a record action; null keeps the neutral default. */
-    protected ?string $recordActionHover = null;
 
     /** Extra class(es) for the keyboard-active row (null keeps the built-in active style). */
     protected ?string $activeRowClass = null;
-
-    /** Behaviour-only record actions also render as buttons in the mobile stacked cards. */
-    protected bool $recordActionButtonsOnMobile = true;
-
-    /** Memoized resolver over the record-action bindings; cleared when they (or selection) change. */
-    private ?RecordActionResolver $recordActionResolver = null;
 
     // Also send a notification (toast) when an inline edit hits an optimistic-lock
     // conflict. Off by default — the conflict is always shown inline on the cell,
@@ -248,6 +222,9 @@ class Table implements Htmlable
     // Re-render the table in the response that writes an inline edit, so summaries,
     // rollups and anything derived from the edited value move with it.
     protected bool $refreshAfterEdit = true;
+
+    /** Opt-in row-granular rendering — {@see rowPartials()}. */
+    protected bool $rowPartials = false;
 
     // Excel-style fill handle on editable cells. Opt-in: dragging it overwrites
     // rows, which would be a silent behaviour change for every existing table
@@ -420,6 +397,10 @@ class Table implements Htmlable
      * @param  string|null  $sortColumn  Simulated sort column
      * @param  string  $sortDirection  Simulated sort direction
      * @return array<string, mixed> QueryPlan debug info
+     *
+     * @throws TableIntrospectionException When the query service produced no plan
+     *                                     to report on — see that class; it cannot
+     *                                     happen with the bundled service.
      */
     public function debugQueryPlan(
         ?string $search = null,
@@ -445,6 +426,11 @@ class Table implements Htmlable
     {
         $this->columns = new ColumnSet($columns);
 
+        // The row-level inactive rule (if any) has to reach these columns too,
+        // and it may have been declared before them — see
+        // {@see Concerns\HasInactiveRecords::shareInactiveStateWithColumns()}.
+        $this->inactiveStatePending = true;
+
         return $this;
     }
 
@@ -469,7 +455,15 @@ class Table implements Htmlable
     /** This table's columns as a set, empty until {@see columns()} says otherwise. */
     protected function columnSet(): ColumnSet
     {
-        return $this->columns ??= new ColumnSet;
+        $set = $this->columns ??= new ColumnSet;
+
+        // The one place every consumer of a column passes through — the render,
+        // the Livewire host's `findColumn()`, the fill writer — so the table's
+        // row-level state reaches an editable column exactly once, whichever
+        // order the two were declared in.
+        $this->shareInactiveStateWithColumns($set);
+
+        return $set;
     }
 
     /**
@@ -488,107 +482,6 @@ class Table implements Htmlable
     public function getFilters(): array
     {
         return $this->filters;
-    }
-
-    /**
-     * @param  array<int, Action|ActionGroup|RecordAction>  $actions  A RecordAction
-     *                                                                is rejected — `Action::make()->onDoubleClick()` returns one, and it
-     *                                                                belongs in `recordActions()`, not here; it is accepted in the type
-     *                                                                only so the mistake is caught with a clear message rather than a
-     *                                                                fatal further down.
-     */
-    public function actions(array $actions): static
-    {
-        foreach ($actions as $action) {
-            // A RecordAction is a row-interaction binding, not a toolbar action.
-            // `Action::make()->onDoubleClick()` returns one; catch the mistake of
-            // dropping it into the actions column with a clear message.
-            if ($action instanceof RecordAction) {
-                throw TableConfigurationException::recordActionInRowActions();
-            }
-        }
-
-        $this->actions = $actions;
-
-        return $this;
-    }
-
-    /**
-     * Check if table has any actions (including ActionGroups), counting record
-     * actions promoted into the column via `alsoInRowActions()`.
-     */
-    public function hasActions(): bool
-    {
-        return ! empty($this->actions) || $this->recordActionResolver()->rowActionButtons() !== [];
-    }
-
-    /**
-     * Get flat list of all actions (expanding ActionGroups)
-     *
-     * @return array<int, Action>
-     */
-    public function getAllActions(): array
-    {
-        $allActions = [];
-
-        foreach ($this->actions as $action) {
-            if ($action instanceof ActionGroup) {
-                // A group can also hold record-less actions (the toolbar folds
-                // its header actions into one); only row actions belong here.
-                $allActions = array_merge($allActions, array_filter(
-                    $action->getActions(),
-                    fn (BaseAction|ActionGroup $inner): bool => $inner instanceof Action,
-                ));
-            } else {
-                $allActions[] = $action;
-            }
-        }
-
-        return $allActions;
-    }
-
-    /**
-     * @return array<int, Action|ActionGroup>
-     */
-    public function getActions(): array
-    {
-        return $this->actions;
-    }
-
-    /**
-     * @param  array<int, Action>  $bulkActions
-     */
-    public function bulkActions(array $bulkActions): static
-    {
-        $this->bulkActions = $bulkActions;
-
-        return $this;
-    }
-
-    /**
-     * @return array<int, Action>
-     */
-    public function getBulkActions(): array
-    {
-        return $this->bulkActions;
-    }
-
-    /**
-     * @param  array<int, Action>  $headerActions
-     */
-    public function headerActions(array $headerActions): static
-    {
-        $this->headerActions = $headerActions;
-
-        return $this;
-    }
-
-    /**
-     * @return array<int, Action>
-     */
-    public function getHeaderActions(): array
-    {
-        return $this->headerActions;
     }
 
     /**
@@ -633,6 +526,28 @@ class Table implements Htmlable
         );
 
         return $this;
+    }
+
+    /**
+     * Whether the footer offers a page-size `<select>`.
+     *
+     * On a grid of columns it is a genuine control: how many rows fit before
+     * you scroll is the reader's business. On a **list** it is table furniture —
+     * a reader of an inbox does not think in tens and fifties, and a
+     * `Show [10] records` dropdown is the last thing that makes a list announce
+     * itself as a table. Turning it off leaves the paging itself untouched; only
+     * the control goes.
+     */
+    public function perPageSelector(bool $show = true): static
+    {
+        $this->showPerPageSelector = $show;
+
+        return $this;
+    }
+
+    public function showsPerPageSelector(): bool
+    {
+        return $this->showPerPageSelector;
     }
 
     /**
@@ -822,21 +737,54 @@ class Table implements Htmlable
      * for the record key. The row loop then fills the key — the same "static once,
      * dynamic per row" move the `<tr>` and the `<td>` chrome already make.
      *
+     * The inert copy is the second and last shape: an inactive row whose state
+     * withholds the checkbox ({@see Support\InactiveRow::selectable()}) splices
+     * that one instead. Still O(shapes), not O(rows).
+     *
      * Worth it because this cell was the most expensive thing left in the row:
      * measured at 2 251 B and 10 whitespace text nodes per row, more than the entire
      * rest of a three-column row. Memoised per table instance, which is also per
      * render — Livewire rebuilds the Table on every request, so nothing goes stale.
      */
-    public function getSelectionCellSkeleton(): Skeleton
+    public function getSelectionCellSkeleton(bool $inert = false): Skeleton
     {
-        return $this->selectionCellSkeleton ??= Skeleton::compile(
+        return $this->selectionCellSkeletons[$inert ? 'inert' : 'live'] ??= Skeleton::compile(
             view('wire-table::tables.partials.selection-cell', [
                 'cellPadding' => $this->getCellPadding(),
                 'usesRangeSelection' => $this->usesRangeSelection(),
                 'checkIcon' => $this->getSelectionCheckIcon(),
+                'inert' => $inert,
                 'keyJs' => Skeleton::slot('keyJs'),
+                'key' => Skeleton::slot('key'),
             ])->render(),
             'keyJs',
+            'key',
+        );
+    }
+
+    /**
+     * The link a record url puts around a cell, compiled once and spliced per
+     * record.
+     *
+     * Both surfaces that offer the affordance fill this one skeleton — every
+     * non-editable cell of a row ({@see Support\RowRenderer}) and the stacked
+     * card's title ({@see Support\CardRenderer}) — so `tables.partials.record-link`
+     * is the single source of the markup and the vendor:publish override point for
+     * both, instead of an `<a>` written twice in PHP.
+     *
+     * Memoised per table instance, which is per render: a row wraps one link per
+     * visible column, so a 10-column page would otherwise pay ten view renders per
+     * row for markup that never changes.
+     */
+    public function getRecordLinkSkeleton(): Skeleton
+    {
+        return $this->recordLinkSkeleton ??= Skeleton::compile(
+            view('wire-table::tables.partials.record-link', [
+                'url' => Skeleton::slot('url'),
+                'content' => Skeleton::slot('content'),
+            ])->render(),
+            'url',
+            'content',
         );
     }
 
@@ -1012,89 +960,6 @@ class Table implements Htmlable
         return $this->emptyStateIcon;
     }
 
-    /**
-     * Actions offered when the table has no records — typically "create the first one".
-     *
-     * The empty state is a record-less surface, so these run through the same
-     * host methods as header actions (modal, form and confirmation included) and
-     * only a static `->url()` resolves. They are not shown when the table is
-     * empty because of a filter: there the offer is to clear the filter, not to
-     * create a record that already exists behind it.
-     *
-     * @param  array<int, Action|HeaderAction>  $actions
-     */
-    public function emptyStateActions(array $actions): static
-    {
-        $this->emptyStateActions = $actions;
-
-        return $this;
-    }
-
-    /**
-     * @return array<int, Action|HeaderAction>
-     */
-    public function getEmptyStateActions(): array
-    {
-        return $this->emptyStateActions;
-    }
-
-    /**
-     * Render the empty-state actions to HTML for the canonical empty-state partial.
-     *
-     * Resolved here rather than in Blade so the view only echoes strings, and so
-     * both action kinds converge on the record-less host methods: a HeaderAction
-     * already renders that way, a row Action is given
-     * {@see EmptyStateActionClickResolver} instead of the row resolver. An action
-     * the viewer may not run renders as an empty string and is dropped.
-     *
-     * @return array<int, string>
-     */
-    public function getEmptyStateActionsHtml(): array
-    {
-        return $this->renderEmptyStateActions($this->emptyStateActions);
-    }
-
-    /**
-     * The same actions for the stacked-card layout's empty state.
-     *
-     * Both layouts sit in the document at every width — CSS decides which is
-     * shown — so the card copy drops the action's `keyboardShortcut()`: a
-     * rendered button binds it as a *window* listener, and two of them would
-     * answer one keypress twice. Same reason the mobile row actions clone.
-     *
-     * @return array<int, string>
-     */
-    public function getMobileEmptyStateActionsHtml(): array
-    {
-        return $this->renderEmptyStateActions(array_map(
-            fn (Action|HeaderAction $action): Action|HeaderAction => (clone $action)->withoutKeyboardShortcut(),
-            $this->emptyStateActions,
-        ));
-    }
-
-    /**
-     * @param  array<int, Action|HeaderAction>  $actions
-     * @return array<int, string>
-     */
-    private function renderEmptyStateActions(array $actions): array
-    {
-        $click = new EmptyStateActionClickResolver;
-
-        $html = [];
-
-        foreach ($actions as $action) {
-            $rendered = $action instanceof HeaderAction
-                ? $action->render()
-                : $action->render(null, $click);
-
-            if ($rendered !== '') {
-                $html[] = $rendered;
-            }
-        }
-
-        return $html;
-    }
-
     public function striped(bool $striped = true): static
     {
         $this->striped = $striped;
@@ -1155,6 +1020,13 @@ class Table implements Htmlable
         return $this->primaryKey;
     }
 
+    /**
+     * Bind the host component a table renders through.
+     *
+     * @docs-ignore Plumbing, not configuration: `WithTable` calls this while
+     * building the table, and a definition that has not been bound cannot render
+     * at all (see {@see toHtml()}). Nothing an owner writes calls it.
+     */
     public function livewireComponent(mixed $component): static
     {
         $this->livewireComponent = $component;
@@ -1165,205 +1037,6 @@ class Table implements Htmlable
     public function getLivewireComponent(): mixed
     {
         return $this->livewireComponent;
-    }
-
-    // Action positioning methods
-
-    /**
-     * Set actions position ('start' or 'end')
-     */
-    public function actionsPosition(string $position): static
-    {
-        $this->actionsPosition = $position;
-
-        return $this;
-    }
-
-    public function getActionsPosition(): string
-    {
-        return $this->actionsPosition;
-    }
-
-    /**
-     * Set actions alignment ('left', 'center', 'right')
-     */
-    public function actionsAlignment(string|Alignment $alignment): static
-    {
-        $this->actionsAlignment = $alignment instanceof Alignment ? $alignment->value : $alignment;
-
-        return $this;
-    }
-
-    public function getActionsAlignment(): string
-    {
-        return $this->actionsAlignment;
-    }
-
-    /**
-     * Canonical literal `text-*` class for the actions column header alignment.
-     */
-    public function getActionsAlignmentClass(): string
-    {
-        return Alignment::resolve($this->actionsAlignment)->textClass();
-    }
-
-    /**
-     * Canonical literal `justify-*` class for the actions row (flex main axis).
-     */
-    public function getActionsJustifyClass(): string
-    {
-        return Alignment::resolve($this->actionsAlignment)->justifyClass();
-    }
-
-    /**
-     * Set the actions column label
-     */
-    public function actionsColumnLabel(?string $label): static
-    {
-        $this->actionsColumnLabel = $label;
-
-        return $this;
-    }
-
-    public function getActionsColumnLabel(): ?string
-    {
-        return $this->actionsColumnLabel;
-    }
-
-    /**
-     * Set the actions column width
-     */
-    public function actionsColumnWidth(?string $width): static
-    {
-        $this->actionsColumnWidth = $width;
-
-        return $this;
-    }
-
-    public function getActionsColumnWidth(): ?string
-    {
-        return $this->actionsColumnWidth;
-    }
-
-    /**
-     * Set the row-action presentation style.
-     *
-     * - 'solid' (default): filled, always-colored buttons — the current look.
-     * - 'quiet': neutral text at rest, semantic color on hover/focus, so a row
-     *   of actions stops competing with the data. Destructive actions stay
-     *   legible (red at rest); mark one action ->solid() to keep it prominent.
-     */
-    public function actionsStyle(string $style): static
-    {
-        $this->actionsStyle = $style;
-
-        return $this;
-    }
-
-    public function getActionsStyle(): string
-    {
-        return $this->actionsStyle;
-    }
-
-    /**
-     * Canonical owner of row-action presentation: returns the configured actions
-     * with the current style applied, so both actions-cell positions render
-     * identically. Applying quiet is idempotent (the same Action instance already
-     * renders for every row).
-     *
-     * @return array<int, Action|ActionGroup>
-     */
-    public function getRowActionsForDisplay(): array
-    {
-        return $this->composeRowActions($this->recordActionResolver()->rowActionButtons());
-    }
-
-    /**
-     * The same list for the mobile stacked-card view, plus — unless
-     * {@see recordActionButtonsOnMobile(false)} says otherwise — a button for
-     * every behaviour-only record action.
-     *
-     * This is what lets one table be an application on a desktop and an ordinary
-     * list on a phone: the row keeps its double-click, right-click and keys
-     * there, and the card offers the very same actions as buttons here. Nothing
-     * is declared twice — it is one action, reached two ways.
-     *
-     * @return array<int, Action|ActionGroup>
-     */
-    public function getMobileRowActionsForDisplay(): array
-    {
-        $resolver = $this->recordActionResolver();
-
-        return $this->composeRowActions(array_merge(
-            $resolver->rowActionButtons(),
-            $this->recordActionButtonsOnMobile ? $resolver->mobileFallbackButtons() : [],
-        ));
-    }
-
-    /**
-     * Whether the mobile card has any action to show — the row actions, plus the
-     * record-action fallback. Its desktop counterpart is {@see hasActions()},
-     * which governs the actions *column* and knows nothing of the fallback: a
-     * table whose only actions are row gestures still has no column.
-     */
-    public function hasMobileActions(): bool
-    {
-        return $this->getMobileRowActionsForDisplay() !== [];
-    }
-
-    /**
-     * Turn the mobile fallback off: behaviour-only record actions then stay
-     * behaviour-only everywhere, and a phone reaches them only through whatever
-     * else the table offers (`alsoInRowActions()`, a `recordUrl()`, …).
-     */
-    public function recordActionButtonsOnMobile(bool $enabled = true): static
-    {
-        $this->recordActionButtonsOnMobile = $enabled;
-
-        return $this;
-    }
-
-    public function showsRecordActionButtonsOnMobile(): bool
-    {
-        return $this->recordActionButtonsOnMobile;
-    }
-
-    /**
-     * Merge the configured row actions with the record-action buttons a surface
-     * asks for, dropping any whose name is already there (a record action
-     * referencing an existing row action must not double it), and apply the
-     * table's action style.
-     *
-     * @param  array<int, Action>  $recordActionButtons
-     * @return array<int, Action|ActionGroup>
-     */
-    private function composeRowActions(array $recordActionButtons): array
-    {
-        $actions = array_values($this->actions);
-
-        $seen = [];
-        foreach ($actions as $action) {
-            if ($action instanceof Action) {
-                $seen[$action->getName()] = true;
-            }
-        }
-
-        foreach ($recordActionButtons as $button) {
-            if (! isset($seen[$button->getName()])) {
-                $actions[] = $button;
-                $seen[$button->getName()] = true;
-            }
-        }
-
-        if ($this->actionsStyle === 'quiet') {
-            foreach ($actions as $action) {
-                if ($action instanceof Action && ! $action->isDivider()) {
-                    $action->quiet();
-                }
-            }
-        }
-
-        return $actions;
     }
 
     // Table styling methods
@@ -1400,6 +1073,43 @@ class Table implements Htmlable
     }
 
     /**
+     * Keep the column headers in view while the rows scroll under them.
+     *
+     * The header pins to the top of the table's own scroll region, not the page,
+     * because that region is already a scrolling ancestor: the wrapper carries
+     * `overflow-x: auto`, and CSS computes the other axis to `auto` alongside it.
+     * That is why turning this on also caps the region's height — a scrollport
+     * the size of its content never scrolls, and a header pinned inside one never
+     * moves. Name your own cap when the default does not suit the page:
+     *
+     * ```php
+     * ->stickyHeader()                 // 70vh of rows under a pinned header
+     * ->stickyHeader(maxHeight: '32rem')
+     * ```
+     *
+     * Any CSS length works; it is written as an inline style, not a class, so it
+     * needs nothing from Tailwind's extractor.
+     */
+    public function stickyHeader(bool $sticky = true, string $maxHeight = self::DEFAULT_STICKY_MAX_HEIGHT): static
+    {
+        $this->stickyHeader = $sticky;
+        $this->stickyHeaderMaxHeight = $maxHeight;
+
+        return $this;
+    }
+
+    public function hasStickyHeader(): bool
+    {
+        return $this->stickyHeader;
+    }
+
+    /** The cap on the scroll region, or null when the header is not sticky. */
+    public function getStickyHeaderMaxHeight(): ?string
+    {
+        return $this->stickyHeader ? $this->stickyHeaderMaxHeight : null;
+    }
+
+    /**
      * Set bordered mode
      */
     public function bordered(bool $bordered = true): static
@@ -1433,325 +1143,6 @@ class Table implements Htmlable
     public function getBulkMaxRecords(): ?int
     {
         return $this->bulkMaxRecords;
-    }
-
-    /**
-     * Shape the stacked mobile card: which column is the title, which is the
-     * supporting line, which is the figure set right, and what sits beside them
-     * as status.
-     *
-     *   ->mobileCard(fn (MobileCardConfig $card) => $card
-     *       ->title('number')->subtitle('customer')->metric('total')->meta('status'))
-     *
-     * Slots left unnamed are derived from the columns, so this is an override,
-     * never a requirement.
-     */
-    public function mobileCard(Closure $callback): static
-    {
-        $this->mobileCardCallback = $callback;
-        $this->resolvedMobileCard = null;
-
-        return $this;
-    }
-
-    /**
-     * The card resolved for a set of visible columns, memoized per column set —
-     * the stacked view would otherwise resolve it once per record.
-     *
-     * @param  array<int, Column>  $visibleColumns
-     */
-    public function getMobileCard(array $visibleColumns): MobileCard
-    {
-        $signature = implode('|', array_map(fn (Column $c): string => $c->getName(), $visibleColumns));
-
-        if ($this->resolvedMobileCard === null || $this->resolvedMobileCardSignature !== $signature) {
-            $this->resolvedMobileCard = MobileCard::resolve($visibleColumns, $this->mobileCardCallback);
-            $this->resolvedMobileCardSignature = $signature;
-        }
-
-        return $this->resolvedMobileCard;
-    }
-
-    /**
-     * Enable stacked/card layout on mobile devices
-     *
-     * @param  bool  $stacked  Whether to use stacked layout
-     * @param  string|Breakpoint  $breakpoint  Breakpoint below which to use stacked layout (sm, md, lg)
-     */
-    public function stackedOnMobile(bool $stacked = true, string|Breakpoint $breakpoint = Breakpoint::Md): static
-    {
-        $this->stackedOnMobile = $stacked;
-        $this->stackedBreakpoint = $breakpoint instanceof Breakpoint ? $breakpoint->value : $breakpoint;
-
-        return $this;
-    }
-
-    public function isStackedOnMobile(): bool
-    {
-        return $this->stackedOnMobile;
-    }
-
-    public function getStackedBreakpoint(): string
-    {
-        return $this->stackedBreakpoint;
-    }
-
-    /**
-     * Responsive class that hides the full table below the stacked breakpoint.
-     *
-     * Owns the breakpoint → Tailwind class mapping in PHP (literal class names so
-     * the JIT scanner sees them); the view only consumes the result. Returns no
-     * hiding class when mobile stacking is disabled.
-     */
-    public function getStackedTableHiddenClass(): string
-    {
-        if (! $this->stackedOnMobile) {
-            return '';
-        }
-
-        return Breakpoint::resolve($this->stackedBreakpoint)->blockFromClass();
-    }
-
-    /**
-     * Responsive class that shows the mobile cards only below the stacked
-     * breakpoint. Companion to {@see getStackedTableHiddenClass()}; defaults to a
-     * fully hidden cards layout when mobile stacking is disabled.
-     */
-    public function getStackedCardsVisibleClass(): string
-    {
-        if (! $this->stackedOnMobile) {
-            return 'hidden';
-        }
-
-        return Breakpoint::resolve($this->stackedBreakpoint)->hiddenAtClass();
-    }
-
-    /**
-     * Collapse the row actions into one dropdown group in the mobile stacked-card
-     * view, so a card header shows a single "⋮" trigger instead of several inline
-     * buttons. No effect on the desktop table, and only meaningful together with
-     * {@see stackedOnMobile()}.
-     *
-     * The collapse only kicks in once a row has at least `$threshold` actions
-     * (default 3); with fewer actions the card keeps them inline. Pass a lower
-     * threshold to collapse sooner, or 1 to always collapse.
-     */
-    public function collapseActionsOnMobile(bool $collapse = true, int $threshold = 3): static
-    {
-        $this->collapseActionsOnMobile = $collapse;
-        $this->collapseActionsOnMobileThreshold = max(1, $threshold);
-
-        return $this;
-    }
-
-    public function getCollapseActionsOnMobileThreshold(): int
-    {
-        return $this->collapseActionsOnMobileThreshold;
-    }
-
-    /**
-     * Whether the mobile card should collapse its row actions: the feature is
-     * enabled and the row carries at least the configured threshold of actions.
-     * The count flattens nested groups and ignores dividers, matching what the
-     * dropdown would actually contain.
-     */
-    public function shouldCollapseActionsOnMobile(): bool
-    {
-        return $this->collapseActionsOnMobile
-            && count($this->flattenMobileRowActions()) >= $this->collapseActionsOnMobileThreshold;
-    }
-
-    /**
-     * Flatten the configured row actions into a single list, expanding nested
-     * {@see ActionGroup}s and dropping dividers. Shared by the collapse threshold
-     * check and {@see getMobileActionGroup()} so both count the same actions.
-     *
-     * @return array<int, Action>
-     */
-    protected function flattenMobileRowActions(): array
-    {
-        $flat = [];
-
-        foreach ($this->getMobileRowActionsForDisplay() as $action) {
-            if ($action instanceof ActionGroup) {
-                foreach ($action->getActions() as $inner) {
-                    // Dividers are chrome, and a group's record-less members
-                    // belong to another surface than a row's actions.
-                    if (! $inner instanceof Action || $inner->isDivider()) {
-                        continue;
-                    }
-
-                    $flat[] = $inner;
-                }
-
-                continue;
-            }
-
-            if ($action->isDivider()) {
-                continue;
-            }
-
-            $flat[] = $action;
-        }
-
-        return $flat;
-    }
-
-    /**
-     * Canonical builder for the mobile card's collapsed action dropdown: wraps the
-     * row actions in a single {@see ActionGroup}, flattening any existing groups so
-     * everything lands under one trigger. The group inherits the table's mobile
-     * bottom-sheet settings and collapses to a lone inline button when only one
-     * action is visible (handled by ActionGroup itself).
-     */
-    public function getMobileActionGroup(): ActionGroup
-    {
-        return $this->buildMobileActionGroup($this->flattenMobileRowActions());
-    }
-
-    /**
-     * The same collapsed dropdown for a sub-row's actions.
-     *
-     * Child actions collapse on a phone unconditionally, unlike row actions
-     * (which honour {@see collapseActionsOnMobile()}): a child line is narrower
-     * than the card that holds it, and two labelled buttons there crush the
-     * product name to an ellipsis. There is no width at which they fit.
-     */
-    public function getMobileSubRowActionGroup(): ActionGroup
-    {
-        $flat = [];
-
-        foreach ($this->getSubRowActions() as $action) {
-            if ($action instanceof ActionGroup) {
-                foreach ($action->getActions() as $inner) {
-                    if ($inner instanceof Action && $inner->isDivider()) {
-                        continue;
-                    }
-
-                    $flat[] = $inner;
-                }
-
-                continue;
-            }
-
-            if ($action instanceof Action && $action->isDivider()) {
-                continue;
-            }
-
-            $flat[] = $action;
-        }
-
-        return $this->buildMobileActionGroup($flat);
-    }
-
-    /**
-     * @param  array<int, BaseAction|ActionGroup>  $actions
-     */
-    private function buildMobileActionGroup(array $actions): ActionGroup
-    {
-        return ActionGroup::make($actions)
-            ->sheetOnMobile($this->usesSheetOnMobile())
-            ->mobileBreakpoint($this->getMobileBreakpoint());
-    }
-
-    /**
-     * Collapse the toolbar's header actions into one dropdown group on a phone,
-     * so a narrow toolbar shows a single "⋮" trigger instead of several labelled
-     * buttons competing with the search field, the filters and the view menu.
-     *
-     * Unlike {@see collapseActionsOnMobile()} this needs no `stackedOnMobile()`:
-     * the toolbar is the same toolbar at every width, so the collapse is purely a
-     * width switch. **Desktop is untouched** — from the mobile breakpoint up the
-     * inline buttons render exactly as before; the breakpoint is the table's
-     * {@see mobileBreakpoint()} (`sm` by default, i.e. below 640px).
-     *
-     * The collapse only kicks in once the toolbar carries at least `$threshold`
-     * executable header actions (default 2 — one button alone is not a crowd, and
-     * the toolbar folds sooner than a card's row actions because it also holds the
-     * search field and the view menu). The threshold is clamped to at least 1.
-     */
-    public function collapseHeaderActionsOnMobile(bool $collapse = true, int $threshold = 2): static
-    {
-        $this->collapseHeaderActionsOnMobile = $collapse;
-        $this->collapseHeaderActionsOnMobileThreshold = max(1, $threshold);
-
-        return $this;
-    }
-
-    public function getCollapseHeaderActionsOnMobileThreshold(): int
-    {
-        return $this->collapseHeaderActionsOnMobileThreshold;
-    }
-
-    /**
-     * Whether the toolbar should collapse its header actions on a phone: the
-     * feature is enabled and at least the configured threshold of header actions
-     * would actually render. The count only includes actions the viewer may run,
-     * because those are the ones that reach the toolbar at all — a table whose
-     * per-viewer guards leave one action keeps that action as a plain button.
-     */
-    public function shouldCollapseHeaderActionsOnMobile(): bool
-    {
-        return $this->collapseHeaderActionsOnMobile
-            && count($this->executableHeaderActions()) >= $this->collapseHeaderActionsOnMobileThreshold;
-    }
-
-    /**
-     * The header actions that reach the toolbar at all: the ones the viewer may
-     * run. Shared by the collapse threshold and {@see getMobileHeaderActionGroup()}
-     * so the count matches what the dropdown would really contain — the inline
-     * buttons drop a guarded action the same way.
-     *
-     * @return array<int, BaseAction>
-     */
-    protected function executableHeaderActions(): array
-    {
-        return array_values(array_filter(
-            $this->headerActions,
-            fn (BaseAction $action): bool => $action->canExecute(),
-        ));
-    }
-
-    /**
-     * Canonical builder for the toolbar's collapsed header-action dropdown: the
-     * same {@see ActionGroup} the row actions collapse into, so a phone gets one
-     * dropdown vocabulary rather than two.
-     *
-     * Both halves sit in the document at every width — CSS decides which is shown
-     * — so the collapsed copy drops each action's `keyboardShortcut()`: a rendered
-     * menu row binds it as a *window* listener, and two of them would answer one
-     * keypress twice. Same reason the mobile row actions and the mobile empty
-     * state clone.
-     */
-    public function getMobileHeaderActionGroup(): ActionGroup
-    {
-        return $this->buildMobileActionGroup(array_map(
-            fn (BaseAction $action): BaseAction => (clone $action)->withoutKeyboardShortcut(),
-            $this->executableHeaderActions(),
-        ));
-    }
-
-    /**
-     * Responsive class for the toolbar's inline header actions: hidden below the
-     * mobile breakpoint (the dropdown stands in for them), a plain flex row from
-     * it up. Empty while the collapse is off, so the buttons render unwrapped.
-     */
-    public function getInlineHeaderActionsClass(): string
-    {
-        if (! $this->shouldCollapseHeaderActionsOnMobile()) {
-            return '';
-        }
-
-        return Breakpoint::resolve($this->getMobileBreakpoint())->flexFromClass();
-    }
-
-    /**
-     * Companion to {@see getInlineHeaderActionsClass()}: shows the collapsed
-     * dropdown only below the mobile breakpoint.
-     */
-    public function getMobileHeaderActionsVisibleClass(): string
-    {
-        return Breakpoint::resolve($this->getMobileBreakpoint())->hiddenAtClass();
     }
 
     /**
@@ -1836,6 +1227,14 @@ class Table implements Htmlable
             ? ($record === null ? null : ($this->rowColor)($record))
             : $this->rowColor;
 
+        // An inactive row's tint is resolved here rather than beside the strike
+        // and the dimming, so it runs through the one row-tint owner every other
+        // coloured row uses — and so an explicit rowColor() always wins, which is
+        // what lets a table tint by status and still mark the cancelled ones.
+        if (($color === null || $color === '') && $this->isRecordInactive($record)) {
+            $color = $this->getInactiveRow()->getColor();
+        }
+
         return $color === null || $color === '' ? null : (string) $color;
     }
 
@@ -1864,7 +1263,10 @@ class Table implements Htmlable
 
         $cursor = $clickable ? 'cursor-pointer' : '';
 
-        return trim("{$base} {$cursor} {$this->activeRowMarkerGutter()} ".((string) $this->getRowClass($record)));
+        return trim(
+            "{$base} {$cursor} {$this->activeRowMarkerGutter()} {$this->getInactiveRowClasses($record)} "
+            .((string) $this->getRowClass($record))
+        );
     }
 
     /**
@@ -1942,15 +1344,6 @@ class Table implements Htmlable
     }
 
     /**
-     * Whether the table carries a whole-row pointer record action (click or
-     * double-click) — the rows are clickable and should read as such.
-     */
-    public function hasRecordActionPointer(): bool
-    {
-        return $this->getRecordActionBindings() !== [];
-    }
-
-    /**
      * Whether this table is a grid in the ARIA sense — the single owner of
      * that decision, and one the gesture layer answers.
      *
@@ -1979,26 +1372,6 @@ class Table implements Htmlable
     }
 
     /**
-     * Whether the delegated `wireRecordActions` controller mounts on the
-     * `<tbody>`: for pointer bindings, a context menu, and every grid —
-     * including a selectable table with no record action, whose keyboard
-     * selection (Space, Shift+arrow, mod+A) and active-row marker live in the
-     * same controller.
-     *
-     * The mouse gestures are listed in their own right, not folded into the
-     * grid: a table may keep the sweep or the Shift-ranges with the keyboard
-     * layer switched off, and both of them live in this controller too.
-     */
-    public function mountsRecordActionController(): bool
-    {
-        return $this->hasRecordActionPointer()
-            || $this->hasRowContextMenu()
-            || $this->usesGridSemantics()
-            || $this->usesDragSelect()
-            || $this->usesRangeSelection();
-    }
-
-    /**
      * ARIA role for the table element: `grid` only when keyboard navigation is
      * on, so a plain data table is never given grid semantics it does not use
      * (see ADR / plan decision — role is conditional, not always applied).
@@ -2009,48 +1382,11 @@ class Table implements Htmlable
     }
 
     /**
-     * The client config the keyboard layer of `wireRecordActions` consumes:
-     * the Enter/Shift+Enter targets, the shortcut map, whether Space toggles
-     * selection and whether Shift+arrows extend it. The active-row marker is
-     * shared with the pointer layer and lives in {@see getActiveRowConfig()};
-     * the mouse gestures in {@see getGestureConfig()}.
-     *
-     * @return array<string, mixed>
-     */
-    public function getRecordActionKeyboardConfig(): array
-    {
-        $resolver = $this->recordActionResolver();
-
-        return [
-            'primary' => $resolver->primaryActionName(),
-            'secondary' => $resolver->secondaryActionName(),
-            'shortcuts' => $resolver->shortcuts(),
-            'selectable' => $this->isSelectable(),
-            'ranges' => $this->usesRangeSelection(),
-        ];
-    }
-
-    /**
-     * Companion of {@see getRowClasses()} for the mobile stacked-card view: the
-     * row tint (or the default white card background) plus the card border and
-     * any custom row class, so a colored row reads the same on phone and desktop.
-     */
-    public function getRowCardClasses(?Model $record): string
-    {
-        $tint = $record === null ? null : $this->getRowColor($record);
-        $background = $tint !== null
-            ? HasColor::getRowTintClasses($tint)
-            : 'bg-white dark:bg-gray-800';
-
-        return trim("{$background} border-b border-gray-200 dark:border-gray-700 ".((string) $this->getRowClass($record)));
-    }
-
-    /**
      * Remember each user's column layout under a stable key.
      *
      * When set, the table loads the user's saved hidden-column set on mount and
      * persists it whenever a column is toggled, via the configured
-     * {@see TablePreferenceDriver} (see `config('wire-table.preferences')`). The
+     * {@see PreferenceDriver} (see `config('wire-table.preferences')`). The
      * key identifies this table across the app — use a distinct, stable string
      * per table (e.g. `'users-index'`). Different users are scoped by the driver,
      * so one key serves everyone.
@@ -2071,10 +1407,44 @@ class Table implements Htmlable
     }
 
     /**
+     * Let a user save the current view under a name and switch between them.
+     *
+     * Saved views ride the same per-user preference store as
+     * {@see rememberColumns()} — a saved view IS this table's preferences under
+     * a name, and the layout being looked at right now is the unnamed one — so
+     * they share its key by default. Pass one only when a table wants saved
+     * views without remembering the current layout.
+     *
+     * What a view carries is {@see TableViewPayload::PATHS}: the sort, the page
+     * size, the search, the filters, the hidden columns. Not the selection and
+     * not an open modal.
+     */
+    public function savedViews(?string $key = null): static
+    {
+        $this->savedViewsKey = $key ?? $this->rememberColumnsKey ?? '';
+
+        return $this;
+    }
+
+    /**
+     * The key saved views are stored under, or null when they are off.
+     *
+     * Off is also what an opted-in table gets when it has no key to store them
+     * under — `savedViews()` with no argument on a table that never called
+     * `rememberColumns()`. Silently doing nothing beats inventing a key from the
+     * component class, which would move the moment anyone renamed it and take
+     * every saved view with it.
+     */
+    public function getSavedViewsKey(): ?string
+    {
+        return ($this->savedViewsKey ?? '') === '' ? null : $this->savedViewsKey;
+    }
+
+    /**
      * Persist this table's preferences through a specific driver, overriding the
      * configured default (e.g. force the database driver for one critical table).
      */
-    public function preferenceDriver(?TablePreferenceDriver $driver): static
+    public function preferenceDriver(?PreferenceDriver $driver): static
     {
         $this->preferenceDriver = $driver;
 
@@ -2084,28 +1454,9 @@ class Table implements Htmlable
     /**
      * The per-table preference driver override, if any.
      */
-    public function getPreferenceDriver(): ?TablePreferenceDriver
+    public function getPreferenceDriver(): ?PreferenceDriver
     {
         return $this->preferenceDriver;
-    }
-
-    /**
-     * Define a dedicated right-click context menu for each row.
-     *
-     * @deprecated Superseded by record actions. Bind an action to the right-click
-     *             trigger instead: `->recordAction(Action::make('edit')->onContextMenu())`.
-     *             Kept as a thin alias — it still populates the same context menu
-     *             (see {@see getContextMenuActions()}) — and will be removed in v2.0.
-     *
-     * @param  array<int, Action|ActionGroup>  $actions
-     */
-    public function rowContextMenu(array $actions): static
-    {
-        Deprecation::method('rowContextMenu', 'recordAction()->onContextMenu', '2.0');
-
-        $this->rowContextMenuActions = $actions;
-
-        return $this;
     }
 
     /**
@@ -2119,30 +1470,6 @@ class Table implements Htmlable
     {
         return $this->getGestures()->allowsContextMenu()
             && $this->getContextMenuActions() !== [];
-    }
-
-    /**
-     * @return array<int, Action|ActionGroup>
-     */
-    public function getRowContextMenuActions(): array
-    {
-        return $this->rowContextMenuActions;
-    }
-
-    /**
-     * The full context-menu action list: the dedicated `rowContextMenu()` actions
-     * plus any record action bound with `onContextMenu()`. This is the single
-     * owner of "what the right-click menu shows" — the record-action layer feeds
-     * the existing menu rather than standing up a second one.
-     *
-     * @return array<int, Action|ActionGroup>
-     */
-    public function getContextMenuActions(): array
-    {
-        return array_merge(
-            array_values($this->rowContextMenuActions),
-            $this->recordActionResolver()->contextMenuActions(),
-        );
     }
 
     /**
@@ -2174,18 +1501,55 @@ class Table implements Htmlable
      *
      * The label is escaped here, at the one place that knows it is text content.
      */
-    public function getGroupHeaderRow(Model $record, int $colSpan): string
+    public function getGroupHeaderRow(Model $record, int $colSpan, bool $isCollapsed = false): string
     {
-        $skeleton = $this->groupHeaderSkeleton ??= Skeleton::compile(
-            view('wire-table::tables.partials.group-header', [
+        if (! $this->hasCollapsibleGroups()) {
+            $skeleton = $this->groupHeaderSkeletons['-'] ??= Skeleton::compile(
+                view('wire-table::tables.partials.group-header', [
+                    'colSpan' => $colSpan,
+                    'cellPadding' => $this->getCellPadding(),
+                    'label' => Skeleton::slot('label'),
+                ])->render(),
+                'label',
+            );
+
+            return $skeleton->fill(['label' => e((string) $this->resolveGroupLabel($record))]);
+        }
+
+        // Two shapes, because the chevron's rotation and `aria-expanded` are
+        // baked into the compiled markup: every group is one of them, so this
+        // renders a view twice per table rather than once per group.
+        $shape = $isCollapsed ? 'c' : 'e';
+
+        $skeleton = $this->groupHeaderSkeletons[$shape] ??= Skeleton::compile(
+            view('wire-table::tables.partials.group-header-collapsible', [
                 'colSpan' => $colSpan,
                 'cellPadding' => $this->getCellPadding(),
+                'isCollapsed' => $isCollapsed,
                 'label' => Skeleton::slot('label'),
+                'group' => Skeleton::slot('group'),
+                'groupJs' => Skeleton::slot('groupJs'),
             ])->render(),
             'label',
+            'group',
+            'groupJs',
         );
 
-        return $skeleton->fill(['label' => e((string) $this->resolveGroupLabel($record))]);
+        $group = (string) $this->getGroupComparisonKey($record);
+
+        return $skeleton->fill([
+            'label' => e((string) $this->resolveGroupLabel($record)),
+            'group' => e($group),
+            // The toggle names its own group three times — the click, the
+            // loading gate and the spinner target — so it is encoded once here
+            // rather than spelled in the view three times.
+            //
+            // Single-quoted and HTML-escaped, not json_encode()'d: a skeleton
+            // slot is spliced in raw, so a JSON string's double quotes would end
+            // the `wire:target="…"` attribute they sit inside. Same spelling
+            // every other Livewire expression in the framework renders as.
+            'groupJs' => e("'".addslashes($group)."'"),
+        ]);
     }
 
     /**
@@ -2201,8 +1565,9 @@ class Table implements Htmlable
      * stop lining up.
      *
      * @param  string  $keyJs  the record key, already encoded for an Alpine expression
+     * @param  string  $key  the same key, escaped for an HTML attribute
      */
-    public function getSubRowCell(string $keyJs, bool $hasToggle, bool $isExpanded): string
+    public function getSubRowCell(string $keyJs, string $key, bool $hasToggle, bool $isExpanded): string
     {
         $shape = ($hasToggle ? 't' : '-').($isExpanded ? 'e' : '-');
 
@@ -2213,11 +1578,66 @@ class Table implements Htmlable
                 'hasToggle' => $hasToggle,
                 'isExpanded' => $isExpanded,
                 'keyJs' => Skeleton::slot('keyJs'),
+                'key' => Skeleton::slot('key'),
             ])->render(),
             'keyJs',
+            'key',
         );
 
-        return $skeleton->fill(['keyJs' => $keyJs]);
+        return $skeleton->fill(['keyJs' => $keyJs, 'key' => $key]);
+    }
+
+    /**
+     * The row's action cell, compiled once for the table and filled per row.
+     *
+     * The `<td>`/`<div>` wrapper never varies — its padding, border and
+     * justification are table-level — so it is one shape with one hole: the
+     * buttons, which this row's records renders into it. Before the row body
+     * moved into PHP this was inline in the loop, where Blade re-decided both
+     * classes and emitted `@foreach` markers on every row.
+     */
+    /**
+     * Send back only the rows a write changed, instead of the table.
+     *
+     * Opt-in, and it stays opt-in because it trades a real thing away: a row
+     * re-rendered on its own keeps its position, so a cell edit that would move
+     * the record under the current sort leaves it where it is until the next full
+     * render. On the tables this is for — a wide editable grid where the edit is
+     * the work — that is the right trade and the win is large: a cell save on a
+     * 25-column, 20-row page costs 3.2 ms and 26 kB as one row against 49.3 ms and
+     * 556 kB as the whole data region.
+     *
+     * {@see usesRowPartials()} is the honest answer to whether it is on, because
+     * three shapes of table cannot use it.
+     */
+    public function rowPartials(bool $condition = true): static
+    {
+        $this->rowPartials = $condition;
+
+        return $this;
+    }
+
+    /**
+     * Whether a write may answer with rows rather than the table.
+     *
+     * Everything that moves with a row now has an anchor of its own, so nothing
+     * refuses any more:
+     *
+     *  - **stacked cards**, the same record rendered again for a narrow width;
+     *  - **summaries**, computed over the whole set and living outside every row;
+     *  - **group subtotals**, moved by a write to any member of the group. Each
+     *    subtotal ROW is anchored rather than the group, because a subtotal is
+     *    several `<tr>`s and `wire:partial` addresses one element — the
+     *    alternative, a `<tbody>` per group, would break the invariant that the
+     *    delegated record-actions controller has exactly one root.
+     *
+     * One thing still takes the full render, and it is a property of the write
+     * rather than of the table: editing the column the table groups BY moves the
+     * record to another group, which is a change to the page's shape.
+     */
+    public function usesRowPartials(): bool
+    {
+        return $this->rowPartials;
     }
 
     /**
@@ -2276,72 +1696,6 @@ class Table implements Htmlable
     // Record actions (row-level interaction: click, double-click, right-click, keys)
 
     /**
-     * Bind an action to a whole-row interaction — a click, double-click,
-     * right-click or key over the empty part of the row runs it, desktop-app
-     * style. Separate from `->actions()` (toolbar buttons), `->bulkActions()`
-     * and `->headerActions()`.
-     *
-     * Accepts an {@see Action} (or a {@see RecordAction} with an explicit
-     * trigger), or the *name* of an action already declared in `->actions()` to
-     * reference it without redefining. Each call appends; call it more than once,
-     * or pass a list to {@see recordActions()}.
-     */
-    public function recordAction(string|Action|RecordAction $action): static
-    {
-        $this->recordActions[] = $action;
-        $this->recordActionResolver = null;
-
-        return $this;
-    }
-
-    /**
-     * Replace the record-action bindings with the given list.
-     *
-     * @param  array<int, string|Action|RecordAction>  $actions
-     */
-    public function recordActions(array $actions): static
-    {
-        $this->recordActions = array_values($actions);
-        $this->recordActionResolver = null;
-
-        return $this;
-    }
-
-    /**
-     * @return array<int, string|Action|RecordAction>
-     */
-    public function getRecordActions(): array
-    {
-        return $this->recordActions;
-    }
-
-    public function hasRecordActions(): bool
-    {
-        return $this->recordActions !== [];
-    }
-
-    /**
-     * The memoized resolver over the record-action bindings. Cleared by the
-     * record-action and selection setters, since the default trigger is
-     * selection-aware.
-     */
-    protected function recordActionResolver(): RecordActionResolver
-    {
-        return $this->recordActionResolver ??= new RecordActionResolver($this);
-    }
-
-    /**
-     * Pointer-trigger → action-name map for the JS controller / Blade x-data
-     * (click, double-click and custom gestures; not context-menu or key).
-     *
-     * @return array<string, string>
-     */
-    public function getRecordActionBindings(): array
-    {
-        return $this->recordActionResolver()->pointerMap();
-    }
-
-    /**
      * The keyboard-gesture legend assembled from this table's configuration —
      * localized {@see ShortcutHint}
      * sections the `?` help modal renders. Empty for tables without grid
@@ -2350,62 +1704,6 @@ class Table implements Htmlable
     public function shortcutLegend(): TableShortcutLegend
     {
         return TableShortcutLegend::for($this);
-    }
-
-    /**
-     * Find a registered row action by name (flattening action groups). The
-     * canonical name lookup a record-action reference resolves against — a
-     * `recordAction('edit')` reuses the very `Action` declared in `->actions()`.
-     */
-    public function findRegisteredAction(string $name): ?Action
-    {
-        foreach ($this->getAllActions() as $action) {
-            if ($action->getName() === $name) {
-                return $action;
-            }
-        }
-
-        return null;
-    }
-
-    /**
-     * The wrapped action instances a record action carries in its own right
-     * (not name references) — the fallback pool the execution endpoints search so
-     * a behaviour-only record action with its own callback still runs.
-     *
-     * @return array<int, Action>
-     */
-    public function getRecordActionInstances(): array
-    {
-        $out = [];
-
-        foreach ($this->recordActions as $entry) {
-            if ($entry instanceof RecordAction && $entry->getAction() !== null) {
-                $out[] = $entry->getAction();
-            } elseif ($entry instanceof Action) {
-                $out[] = $entry;
-            }
-        }
-
-        return $out;
-    }
-
-    /**
-     * Tint a record-action row on hover with a semantic role or hue instead of
-     * the neutral default (e.g. `->recordActionHover('primary')`). Null keeps the
-     * existing neutral hover, so enabling record actions never silently restyles
-     * an existing table.
-     */
-    public function recordActionHover(?string $color): static
-    {
-        $this->recordActionHover = $color === '' ? null : $color;
-
-        return $this;
-    }
-
-    public function getRecordActionHover(): ?string
-    {
-        return $this->recordActionHover;
     }
 
     /**
@@ -2749,8 +2047,46 @@ class Table implements Htmlable
         return $this->toHtml();
     }
 
+    /**
+     * Render through the host, which is the only thing that can render a table.
+     *
+     * `AI_CODING_STANDARD.md` rule 3 is why this has to work rather than go away:
+     * *components implement `Htmlable`; `{{ $component }}` must render without
+     * helpers.* It did not. The method called
+     * `view('wire-table::tables.index', ['table' => $this])` directly and had been
+     * broken for as long as that view needed anything beyond the table — it left
+     * `$component` and `$records` undefined, so `{{ $table }}` died on a method
+     * call against null. Nothing caught it because nothing exercised it:
+     * `relation-manager.blade.php` renders `{{ $this->table }}`, which is the
+     * component's computed property and already goes through
+     * {@see WithTable::getTableProperty()}.
+     *
+     * Delegating there fixes a second thing the direct call got wrong — the view
+     * name. `getTableProperty()` honours `getTableView()`, so a reorderable table
+     * renders wire-sortable's wrapper rather than the inner table stripped of its
+     * drag controller.
+     *
+     * Reaching for the host sits uneasily beside rule 6 (a component knows only
+     * itself and its configuration). The exception is deliberate and already
+     * conceded by {@see livewireComponent()}: a table's *definition* cannot
+     * produce a render, because the state, the page of records and the component
+     * id every client binding is scoped to all live on the host.
+     */
     public function toHtml(): string
     {
-        return view('wire-table::tables.index', ['table' => $this])->render();
+        $component = $this->getLivewireComponent();
+
+        if (! is_object($component) || ! method_exists($component, 'getTableProperty')) {
+            throw TableHasNoHostException::make();
+        }
+
+        // Rendering the view directly is not a Livewire render, so nothing shares
+        // the component with the view factory — and the table's rows live in an
+        // `@island`, which emits NOTHING without it rather than throwing. See
+        // IslandViewScope::within().
+        return IslandViewScope::within(
+            $component,
+            fn (): string => $component->getTableProperty()->render(),
+        );
     }
 }

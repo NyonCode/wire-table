@@ -115,7 +115,7 @@ class PfComponent extends Component
         }
 
         if ($this->contextMenu) {
-            $table->gestures()->rowContextMenu([Action::make('edit')->label('Edit')]);
+            $table->gestures()->recordAction(Action::make('edit')->label('Edit')->onContextMenu());
         }
 
         if ($this->subRows) {
@@ -329,26 +329,40 @@ it('emits balanced morph markers in every table shape', function () {
 });
 
 it('keeps a row under its byte budget', function () {
-    // Measured 2026-08-08: 1823 B/row for three plain text cells, down from 4214.
-    // Two changes got it there — the <td> chrome assembled once per column instead of
-    // interpolated by Blade per cell (4214 → 2347), and the <tr> opening tag compiled
-    // once for the table instead of re-deciding four table-level `@if`s per row
+    // Measured 2026-08-08 on Livewire 3: 1823 B/row for three plain text cells, down
+    // from 4214. Two changes got it there — the <td> chrome assembled once per column
+    // instead of interpolated by Blade per cell (4214 → 2347), and the <tr> opening tag
+    // compiled once for the table instead of re-deciding four table-level `@if`s per row
     // (2347 → 1823). The headroom is for a class-list edit, not for a new wrapper:
     // crossing this means every commit got bigger for every user.
+    //
+    // Re-measured 2026-08-14 on Livewire 4.4.0: 1826.75 B/row. `smart_wire_keys`
+    // defaults to true on v4 and compiles wire:keys into loops, so this was expected to
+    // move — it did not, because the cells are concatenated by a raw PHP `foreach`
+    // inside an `@php` block (`$cellsHtml` in `tables/index.blade.php`), not by a Blade
+    // `@foreach`, so the v4 key compiler never sees a loop here. The +3.75 B is drift.
     expect(pfPerRow()['bytes'])->toBeLessThan(1900);
 });
 
 it('keeps a row under its whitespace-node budget', function () {
-    // Measured 2026-08-08: 11 runs/row, down from 21 — the cells no longer contribute
-    // any, because they are concatenated in PHP rather than laid out by a @foreach.
-    // Deterministic, so the budget is the measurement: one more nested tag pair
-    // written into the row loop shows up here immediately.
+    // Measured 2026-08-08 on Livewire 3: 11 runs/row, down from 21 — the cells no longer
+    // contribute any, because they are concatenated in PHP rather than laid out by a
+    // @foreach. Deterministic, so the budget is the measurement: one more nested tag
+    // pair written into the row loop shows up here immediately.
+    //
+    // Re-measured 2026-08-14 on Livewire 4.4.0: 11 runs/row, unchanged. Note the budget
+    // sits EXACTLY on the measurement — there is no headroom, so the next change to trip
+    // this has not necessarily regressed anything, it has simply used the first byte of
+    // slack that never existed. Re-measure before deciding.
     expect(pfPerRow()['whitespaceRuns'])->toBeLessThanOrEqual(11);
 });
 
 it('keeps a row under its morph-marker budget', function () {
-    // Measured 2026-08-08: 16 comments/row = 8 conditionals, down from 24. Dropping
-    // the per-cell @foreach and its nested @if took four pairs with it.
+    // Measured 2026-08-08 on Livewire 3: 16 comments/row = 8 conditionals, down from 24.
+    // Dropping the per-cell @foreach and its nested @if took four pairs with it.
+    //
+    // Re-measured 2026-08-14 on Livewire 4.4.0: 16 comments/row, unchanged. Like the
+    // whitespace budget above, this one sits exactly on the measurement.
     //
     // Do NOT try to win the last few by deleting conditionals from the row loop. The
     // context-menu `@if` was removed on exactly that reasoning — the panel string is
@@ -394,6 +408,12 @@ it('keeps the context-menu panel to its items', function () {
     // Measured 2026-08-08: 982 B (−41 %) and 7 whitespace nodes. What is left is
     // almost entirely the item markup itself, which is genuinely per-record (an action
     // may be hidden for this row) and is core's dropdown-item, not this partial.
+    //
+    // Re-measured 2026-09-08 at 1242 B, and the extra 260 B are not the panel: with
+    // `Table::rowContextMenu()` removed in 2.0 the menu is bound as a record action,
+    // and a table that has record actions is a grid — so every row also carries the
+    // role and tabindex the keyboard layer needs. That is the trade the removal makes:
+    // the dedicated list was cheaper per row and could only be opened with a mouse.
     $plain = pfPerRow();
     $menu = pfPerRow(contextMenu: true);
 
@@ -402,7 +422,7 @@ it('keeps the context-menu panel to its items', function () {
         'whitespaceRuns' => $menu['whitespaceRuns'] - $plain['whitespaceRuns'],
     ];
 
-    expect($panel['bytes'])->toBeLessThan(1050)
+    expect($panel['bytes'])->toBeLessThan(1300)
         ->and($panel['whitespaceRuns'])->toBeLessThanOrEqual(7);
 });
 
@@ -434,10 +454,15 @@ it('keeps the actions cell to its buttons', function () {
     // used to lay out around markup that never varies.
     //
     // What is left is the button itself (core's actions/button.blade.php), which is
-    // genuinely per-record and belongs to the action-render work, not to this loop. The
-    // @foreach and its markers stay: an action can be non-executable for one row and
-    // not the next, so the button list really does change — the case §8f showed the
-    // markers exist for.
+    // genuinely per-record and belongs to the action-render work, not to this loop.
+    //
+    // The comment budget went 10 → 8 when the row body moved into PHP
+    // (Support\RowRenderer). It used to say the `@foreach` and its markers had to
+    // stay, because an action can be non-executable for one row and not the next
+    // and the button list really does change. That was true of the markers and is
+    // now true of something cheaper: each record-scoped button carries
+    // `wire:key="act-{key}-{name}"`, so the morph pairs them by identity instead —
+    // see RowMorphKeysTest, which is what holds that in place.
     $plain = pfPerRow();
     $actions = pfPerRow(actions: true);
 
@@ -449,7 +474,7 @@ it('keeps the actions cell to its buttons', function () {
 
     expect($cell['bytes'])->toBeLessThan(1220)
         ->and($cell['whitespaceRuns'])->toBeLessThanOrEqual(10)
-        ->and($cell['comments'])->toEqual(10);
+        ->and($cell['comments'])->toEqual(8);
 });
 
 it('keeps the sibling rows off the row budget', function () {
@@ -511,7 +536,11 @@ it('keeps the stacked mobile card off the row budget', function () {
 
     expect($card['bytes'])->toBeLessThan(2950)
         ->and($card['whitespaceRuns'])->toBeLessThanOrEqual(10)
-        ->and($card['comments'])->toEqual(22);
+        // 22 → 13 when the card body moved into Support\CardRenderer: its shell is
+        // compiled once for the table now, so the conditionals that were decided
+        // per card — and emitted a morph marker each time — are decided once.
+        // What is left belongs to the cells themselves.
+        ->and($card['comments'])->toEqual(13);
 });
 
 it('keeps a copyable cell to one button', function () {
