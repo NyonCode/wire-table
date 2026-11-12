@@ -52,7 +52,9 @@ use NyonCode\WireTable\Export\ExportAction;
 use NyonCode\WireTable\Export\ExportFormat;
 use NyonCode\WireTable\Export\Jobs\RunExportJob;
 use NyonCode\WireTable\Export\TableExport;
+use NyonCode\WireTable\Filters\DateFilter;
 use NyonCode\WireTable\Filters\Filter;
+use NyonCode\WireTable\Filters\SelectFilter;
 use NyonCode\WireTable\Import\ImportAction;
 use NyonCode\WireTable\Import\ImportColumn;
 use NyonCode\WireTable\Import\ImportResult;
@@ -61,6 +63,7 @@ use NyonCode\WireTable\Import\TableImport;
 use NyonCode\WireTable\Preferences\TablePreferenceManager;
 use NyonCode\WireTable\Preferences\TableViewPayload;
 use NyonCode\WireTable\Services\CellEditPipeline;
+use NyonCode\WireTable\Services\FilterFacets;
 use NyonCode\WireTable\Services\SubRowQuery;
 use NyonCode\WireTable\Services\SummaryBatch;
 use NyonCode\WireTable\Services\SummarySet;
@@ -118,6 +121,7 @@ trait WithTable
     // engine is here; the table's own anchors and the flag that turns them on are
     // the next slice — nothing calls renderPartial() yet.
     use InteractsWithPartials;
+    use InteractsWithQueryBuilderFilters;
     use InteractsWithRepeaters;
     use InteractsWithSelectCreation;
     use InteractsWithTableModals;
@@ -889,11 +893,91 @@ trait WithTable
         // are memoised by getTableRecords() for every path except lazy-not-ready,
         // which returns a fresh empty collection each call — value-identical, so
         // the plan agrees with the view either way.
+        if ($this->renderPlan === null) {
+            $this->resolveDatePresets();
+            $this->countFilterOptions();
+        }
+
         return $this->renderPlan ??= TableRenderPlan::build(
             $this->getTable(),
             $this,
             $this->getTableRecords(),
         );
+    }
+
+    /**
+     * Write today's dates for every date range that holds a preset name.
+     *
+     * The name is what is kept (a saved view, a link: "last 7 days" stays
+     * relative), but the picker shows — and the user edits — the two dates. A
+     * state that arrives with the name alone, or with yesterday's dates, gets
+     * them worked out again here, before the render the picker draws.
+     */
+    protected function resolveDatePresets(): void
+    {
+        $table = $this->getTable();
+
+        foreach (['filters' => $table->getFilters(), 'columnFilters' => array_filter(array_map(fn ($column) => $column->getFilter(), $table->getColumns()))] as $key => $filters) {
+            $state = $this->tableState->get($key, []);
+            $changed = false;
+
+            foreach ($filters as $name => $filter) {
+                $stateKey = $key === 'columnFilters' ? $table->getColumns()[$name]->getName() : $filter->getName();
+                $value = $state[$stateKey] ?? null;
+
+                if (! $filter instanceof DateFilter || $filter->presetFromState($value) === null) {
+                    continue;
+                }
+
+                $range = $filter->resolveRange($value);
+
+                if (($value['from'] ?? null) !== $range['from'] || ($value['to'] ?? null) !== $range['to']) {
+                    $state[$stateKey] = array_merge($value, $range);
+                    $changed = true;
+                }
+            }
+
+            if ($changed) {
+                $this->tableState->set($key, $state);
+            }
+        }
+    }
+
+    /**
+     * Hand every select filter that counts its options (or reads them from the
+     * data) this render's counts — see {@see FilterFacets}. Once per render,
+     * with the plan: a count belongs to the state the rows were drawn from.
+     */
+    protected function countFilterOptions(): void
+    {
+        $table = $this->getTable();
+
+        if (! $this->isTableReady()) {
+            return;
+        }
+
+        $facets = null;
+        $filterValues = $this->tableState->get('filters', []);
+        $columnFilterValues = $this->tableState->get('columnFilters', []);
+        $search = $this->tableState->get('search');
+
+        foreach ($table->getFilters() as $filter) {
+            if ($filter instanceof SelectFilter && $filter->wantsFacets() && $filter->canView()) {
+                $facets ??= app(FilterFacets::class);
+                $filter->facets($facets->count($table, $filter, $filterValues, $columnFilterValues, $search, $filter->getName(), isColumnFilter: false));
+            }
+        }
+
+        foreach ($table->getColumns() as $column) {
+            $filter = $column->getFilter();
+
+            // A column that hides its cell on some records would have those
+            // values listed (and counted) here for anyone to read — no facets.
+            if ($filter instanceof SelectFilter && $filter->wantsFacets() && $filter->canView() && $column->canView() && ! $column->hasRecordVisibility()) {
+                $facets ??= app(FilterFacets::class);
+                $filter->facets($facets->count($table, $filter, $filterValues, $columnFilterValues, $search, $column->getName(), isColumnFilter: true));
+            }
+        }
     }
 
     /**
@@ -1494,9 +1578,19 @@ trait WithTable
      */
     public function resetTableFilters(): void
     {
-        $this->tableState->set('filters', []);
-        $this->tableState->set('columnFilters', []);
+        $this->tableState->set('filters', $this->emptyPanelFilterSlots());
+        $this->tableState->set('columnFilters', $this->emptyColumnFilterSlots());
         $this->tableState->set('search', null);
+        $this->resetPage();
+    }
+
+    /**
+     * Apply a deferred filter panel (Table::deferFilters()). The values it holds
+     * arrive with this very request — the controls bind without `.live` — so
+     * all that is left is to start again from the first page.
+     */
+    public function applyTableFilters(): void
+    {
         $this->resetPage();
     }
 
@@ -1505,7 +1599,7 @@ trait WithTable
      */
     public function resetColumnFilters(): void
     {
-        $this->tableState->set('columnFilters', []);
+        $this->tableState->set('columnFilters', $this->emptyColumnFilterSlots());
         $this->resetPage();
     }
 
@@ -1516,6 +1610,14 @@ trait WithTable
     {
         $filters = $this->tableState->get('filters', []);
         Arr::forget($filters, $name);
+
+        // A filter with an operator picker keeps its slot, back on the default
+        // comparison — the picker binds into it and an absent path shows no
+        // operator at all.
+        $slot = Arr::get($this->emptyPanelFilterSlots(), $name);
+        if ($slot !== null) {
+            Arr::set($filters, $name, $slot);
+        }
 
         // Prune empty parent nests left behind by a dotted (relation) filter name
         // so cleared filters don't accumulate stale [] containers in the state.
@@ -1528,6 +1630,48 @@ trait WithTable
 
         $this->tableState->set('filters', $filters);
         $this->resetPage();
+    }
+
+    /**
+     * Cleared state for the panel filters that cannot simply be absent: one
+     * with an operator picker keeps `{value: null, operator: <default>}`.
+     *
+     * @return array<string, mixed>
+     */
+    protected function emptyPanelFilterSlots(): array
+    {
+        $slots = [];
+
+        foreach ($this->getTable()->getFilters() as $filter) {
+            if ($filter->hasOperatorPicker()) {
+                Arr::set($slots, $filter->getName(), $filter->wrapValue(null));
+            } elseif (! $filter->isMultiple() && is_array($filter->emptyState())) {
+                // A keyed shape the controls bind into — a range's bounds, a
+                // query builder's {combinator, rules}.
+                Arr::set($slots, $filter->getName(), $filter->emptyState());
+            }
+        }
+
+        return $slots;
+    }
+
+    /**
+     * Cleared state for the header filters: each column's empty slot, so a
+     * multi-select stays an array and an operator picker keeps its operator.
+     *
+     * @return array<string, mixed>
+     */
+    protected function emptyColumnFilterSlots(): array
+    {
+        $slots = [];
+
+        foreach ($this->getTable()->getColumns() as $column) {
+            if ($column->isFilterable()) {
+                $slots[$column->getName()] = $column->initialFilterState();
+            }
+        }
+
+        return $slots;
     }
 
     /**
@@ -1589,6 +1733,43 @@ trait WithTable
     }
 
     /**
+     * "Only this value" / "Exclude this value" from a cell's menu: set the
+     * column's header filter to the value the record holds in that column.
+     *
+     * The value is read from the record on the server, never taken from the
+     * page: the cell shows a formatted value ("12. 3. 2026", "Administrator"),
+     * and the filter compares the stored one. A column whose filter cannot say
+     * it (exclusion without a negative operator) is left as it was.
+     */
+    public function filterByCellValue(string $recordKey, string $column, bool $exclude = false): void
+    {
+        $columnObject = $this->findColumn($column);
+        $filter = $columnObject?->getFilter();
+
+        if ($columnObject === null || $filter === null || ! $filter->canView() || ! $columnObject->canView()) {
+            return;
+        }
+
+        $record = $this->getTable()->getQuery()->whereKey($recordKey)->first();
+
+        // A cell the user cannot see is not a value they may filter by.
+        if ($record === null || ! $columnObject->isVisibleForRecord($record)) {
+            return;
+        }
+
+        $state = $filter->stateForCellValue(data_get($record, $column), $exclude);
+
+        if ($state === null) {
+            return;
+        }
+
+        $columnFilters = $this->tableState->get('columnFilters', []);
+        $columnFilters[$column] = $state;
+        $this->tableState->set('columnFilters', $columnFilters);
+        $this->resetPage();
+    }
+
+    /**
      * Clear a single column header filter (used by its indicator chip's remove
      * button), mirroring removeTableFilter() for panel filters.
      */
@@ -1596,6 +1777,11 @@ trait WithTable
     {
         $columnFilters = $this->tableState->get('columnFilters', []);
         Arr::forget($columnFilters, $name);
+
+        $slot = $this->emptyColumnFilterSlots()[$name] ?? null;
+        if ($slot !== null) {
+            $columnFilters[$name] = $slot;
+        }
 
         if (str_contains($name, '.')) {
             $parent = substr($name, 0, (int) strrpos($name, '.'));

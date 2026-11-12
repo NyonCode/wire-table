@@ -521,6 +521,12 @@ class Column extends DataComponent implements HasSearchColumns, HasSearchValueTy
         return $this;
     }
 
+    /** Whether some records may hide this column's cell ({@see visibleForRecord()}). */
+    public function hasRecordVisibility(): bool
+    {
+        return $this->visibleForRecordCallback !== null;
+    }
+
     /**
      * Whether this column's cell is visible for the given record. Structural
      * visibility ({@see canView()}) is checked separately by renderCell.
@@ -1031,13 +1037,23 @@ class Column extends DataComponent implements HasSearchColumns, HasSearchValueTy
         $namespacedView = "wire-table::$viewName";
         $resolvedView = view()->exists($namespacedView) ? $namespacedView : $viewName;
 
-        return view($resolvedView, [
+        $data = [
             'column' => $this,
             'filter' => $filter,
             'value' => $value,
             'statePath' => $statePath ?? 'tableState.columnFilters.'.$this->getName(),
             'controlClasses' => FilterControl::classes(),
-        ])->render();
+        ];
+
+        // With a choice of comparison the state is {value, operator}: one
+        // wrapper draws the picker and hands the filter's own control `.value`.
+        if ($filter->hasOperatorPicker()) {
+            return view('wire-table::tables.columns.partials.filter-with-operator', $data + [
+                'valueView' => $resolvedView,
+            ])->render();
+        }
+
+        return view($resolvedView, $data)->render();
     }
 
     public function toHtml(): string

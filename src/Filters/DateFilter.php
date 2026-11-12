@@ -4,13 +4,18 @@ declare(strict_types=1);
 
 namespace NyonCode\WireTable\Filters;
 
+use Carbon\CarbonImmutable;
 use DateTimeInterface;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\ViewErrorBag;
 use NyonCode\WireCore\Core\Support\Trans;
 use NyonCode\WireCore\Foundation\Support\DateBoundary;
+use NyonCode\WireForms\Components\DateRangePicker;
 use NyonCode\WireForms\Components\DateTimePicker;
+use NyonCode\WireTable\Enums\DatePreset;
+use NyonCode\WireTable\Enums\FilterOperator;
 
 class DateFilter extends Filter
 {
@@ -25,6 +30,16 @@ class DateFilter extends Filter
     protected ?string $fromLabel = null;
 
     protected ?string $toLabel = null;
+
+    /**
+     * The named ranges offered beside the dates; empty for none.
+     *
+     * @var list<DatePreset>
+     */
+    protected array $presets = [];
+
+    /** The timezone "today" is read in; null is the application's. */
+    protected ?string $timezone = null;
 
     /** Filter by a from/to date range instead of a single date. */
     public function range(bool $range = true): static
@@ -141,6 +156,180 @@ class DateFilter extends Filter
      * @param  Builder<Model>  $query
      * @return Builder<Model>
      */
+    /**
+     * Offer named ranges — today, last 7 days, this month… — beside the dates
+     * (range mode only; turns range on). `true` offers them all, a list offers
+     * those. What is stored is the name, so a saved view stays relative.
+     *
+     * @param  array<int, DatePreset|string>|bool  $presets
+     */
+    public function presets(array|bool $presets = true): static
+    {
+        $this->presets = match (true) {
+            $presets === true => DatePreset::cases(),
+            $presets === false => [],
+            default => array_values(array_filter(array_map(
+                static fn (DatePreset|string $preset): ?DatePreset => $preset instanceof DatePreset ? $preset : DatePreset::tryFrom($preset),
+                $presets,
+            ))),
+        };
+
+        if ($this->presets !== []) {
+            $this->range = true;
+        }
+
+        return $this;
+    }
+
+    /** @return list<DatePreset> */
+    public function getPresets(): array
+    {
+        return $this->presets;
+    }
+
+    public function hasPresets(): bool
+    {
+        return $this->presets !== [];
+    }
+
+    /** The timezone a preset's "today" is read in (defaults to the application's). */
+    public function timezone(?string $timezone): static
+    {
+        $this->timezone = $timezone;
+
+        return $this;
+    }
+
+    /** The preset the state names, if this filter offers it. */
+    public function presetFromState(mixed $value): ?DatePreset
+    {
+        $preset = is_array($value) && is_string($value['preset'] ?? null) ? DatePreset::tryFrom($value['preset']) : null;
+
+        return $preset !== null && in_array($preset, $this->presets, true) ? $preset : null;
+    }
+
+    /**
+     * The dates a range state covers: a preset's, worked out now, or the
+     * from/to typed in.
+     *
+     * @return array{from: mixed, to: mixed}
+     */
+    public function resolveRange(mixed $value): array
+    {
+        $preset = $this->presetFromState($value);
+
+        if ($preset !== null) {
+            return $preset->range(CarbonImmutable::now($this->timezone ?? config('app.timezone')));
+        }
+
+        return ['from' => $value['from'] ?? null, 'to' => $value['to'] ?? null];
+    }
+
+    /**
+     * A single date compares by day: on, not on, before, after, and emptiness.
+     * (A range has its own from/to and does not offer operators.)
+     */
+    public function supportedOperators(): array
+    {
+        if ($this->range || $this->monthMode) {
+            return [];
+        }
+
+        return [FilterOperator::Equals, FilterOperator::NotEquals, FilterOperator::LessThan, FilterOperator::LessThanOrEqual, FilterOperator::GreaterThan, FilterOperator::GreaterThanOrEqual, FilterOperator::IsEmpty, FilterOperator::IsNotEmpty];
+    }
+
+    /** A condition about a date picks a day. */
+    public function builderInput(): string
+    {
+        return 'date';
+    }
+
+    /**
+     * The calendar a single date is picked with — the forms DateTimePicker, the
+     * same control a form draws, bound straight to the filter's state path.
+     */
+    public function dateControl(string $statePath): DateTimePicker
+    {
+        $split = (int) strrpos($statePath, '.');
+
+        $picker = DateTimePicker::make(substr($statePath, $split + 1))
+            ->asDate()
+            ->label($this->getLabel())
+            ->hiddenLabel()
+            ->placeholder($this->getPlaceholder())
+            ->minDate($this->minDate)
+            ->maxDate($this->maxDate)
+            ->statePath(substr($statePath, 0, $split))
+            ->live();
+
+        $livewire = app('livewire')->current();
+        if ($livewire !== null) {
+            $picker->livewire($livewire);
+        }
+
+        return $picker;
+    }
+
+    /**
+     * The calendar a range is picked with — the forms DateRangePicker: one box,
+     * two months side by side, the presets beside them; on a phone the two
+     * pickers with the presets as chips. Bound to `{from, to}` under the
+     * filter's state path, and — with ->presets() — writing the preset's NAME
+     * to `preset` too, so the range stays relative (DatePreset).
+     */
+    public function rangeControl(string $statePath): DateRangePicker
+    {
+        $range = DateRangePicker::make($this->name)
+            ->from('from')
+            ->until('to')
+            ->label($this->getLabel())
+            ->hiddenLabel()
+            ->fromLabel($this->getFromLabel())
+            ->untilLabel($this->getToLabel())
+            ->minDate($this->minDate)
+            ->maxDate($this->maxDate);
+
+        if ($this->hasPresets()) {
+            $now = CarbonImmutable::now($this->timezone ?? config('app.timezone'));
+            $presets = [];
+
+            foreach ($this->presets as $preset) {
+                $dates = $preset->range($now);
+                $presets[$preset->label()] = [$dates['from'], $dates['to'], $preset->value];
+            }
+
+            $range->presets($presets)->rememberPreset('preset');
+        }
+
+        $range->prepareChildren($statePath, live: true, livewire: app('livewire')->current());
+
+        return $range;
+    }
+
+    /**
+     * A forms picker as markup. The forms views read `$errors`, which the web
+     * middleware shares on a page; a filter drawn outside one (a test, a
+     * partial render) gets an empty bag rather than an undefined variable.
+     */
+    public function controlHtml(DateTimePicker|DateRangePicker $control): string
+    {
+        if (! view()->shared('errors')) {
+            view()->share('errors', new ViewErrorBag);
+        }
+
+        return $control->toHtml();
+    }
+
+    /** Days are before and after, not less and greater. */
+    public function operatorLabel(FilterOperator $operator): string
+    {
+        return match ($operator) {
+            FilterOperator::Equals, FilterOperator::NotEquals, FilterOperator::LessThan, FilterOperator::LessThanOrEqual,
+            FilterOperator::GreaterThan, FilterOperator::GreaterThanOrEqual => Trans::get('wire-table::messages.date_operator_'.$operator->value),
+            default => $operator->label(),
+        };
+    }
+
     public function apply(Builder $query, mixed $value): Builder
     {
         if ($value === null || $value === '' || $value === []) {
@@ -151,6 +340,10 @@ class DateFilter extends Filter
             return $this->applyQueryCallback($query, $this->normalizeValue($value), $value);
         }
 
+        if ($this->hasOperatorPicker()) {
+            return $this->applyDateOperator($query, $this->getActiveOperator(), $value);
+        }
+
         $column = $this->getColumn();
 
         if ($this->monthMode) {
@@ -158,11 +351,13 @@ class DateFilter extends Filter
         }
 
         if ($this->range && is_array($value)) {
-            if (! empty($value['from'])) {
-                $query->whereDate($column, '>=', $value['from']);
+            $range = $this->resolveRange($value);
+
+            if (! empty($range['from'])) {
+                $query->whereDate($column, '>=', $range['from']);
             }
-            if (! empty($value['to'])) {
-                $query->whereDate($column, '<=', $value['to']);
+            if (! empty($range['to'])) {
+                $query->whereDate($column, '<=', $range['to']);
             }
 
             return $query;
@@ -170,6 +365,37 @@ class DateFilter extends Filter
 
         /** @var Builder<Model> */
         return $query->whereDate($column, $value);
+    }
+
+    /**
+     * One day comparison. Compared by DATE, not by the stored value: on a
+     * datetime column "on 3 March" has to match 3 March at 14:00.
+     *
+     * @param  Builder<Model>  $query
+     * @return Builder<Model>
+     */
+    protected function applyDateOperator(Builder $query, FilterOperator $operator, mixed $value): Builder
+    {
+        $column = $this->getColumn();
+
+        if (! $operator->requiresValue()) {
+            $operator->constrain($query, $column, null);
+
+            return $query;
+        }
+
+        if (! is_string($value) || $value === '') {
+            return $query;
+        }
+
+        return match ($operator) {
+            FilterOperator::NotEquals => $query->where(static fn (Builder $q) => $q->whereNull($column)->orWhereDate($column, '!=', $value)),
+            FilterOperator::LessThan => $query->whereDate($column, '<', $value),
+            FilterOperator::LessThanOrEqual => $query->whereDate($column, '<=', $value),
+            FilterOperator::GreaterThan => $query->whereDate($column, '>', $value),
+            FilterOperator::GreaterThanOrEqual => $query->whereDate($column, '>=', $value),
+            default => $query->whereDate($column, $value),
+        };
     }
 
     /**
@@ -200,6 +426,19 @@ class DateFilter extends Filter
     public function toPlannerDefinitions(mixed $value): array
     {
         return [];
+    }
+
+    /**
+     * The panel draws a range and a single date with the forms pickers, as the
+     * header does; a month keeps the plain month input of the shared template.
+     */
+    protected function filterView(): string
+    {
+        return match (true) {
+            $this->monthMode => parent::filterView(),
+            $this->range => 'tables.filters.date-range',
+            default => 'tables.filters.date',
+        };
     }
 
     public function inlineView(): string
@@ -243,10 +482,46 @@ class DateFilter extends Filter
         ];
     }
 
+    /** "Only this value" on a date cell is that day; a day cannot be excluded. */
+    public function stateForCellValue(mixed $value, bool $exclude = false): mixed
+    {
+        if ($exclude || $value === null || $value === '' || $this->monthMode) {
+            return null;
+        }
+
+        try {
+            $day = Carbon::parse($value instanceof DateTimeInterface ? $value->format('Y-m-d H:i:s') : (string) $value)->format('Y-m-d');
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return $this->range
+            ? array_merge((array) $this->emptyState(), ['from' => $day, 'to' => $day])
+            : $day;
+    }
+
+    /** A range binds from/to (and preset), so all of them exist from the start. */
+    public function emptyState(): mixed
+    {
+        if (! $this->range || $this->monthMode) {
+            return parent::emptyState();
+        }
+
+        $state = ['from' => null, 'to' => null];
+
+        if ($this->hasPresets()) {
+            $state['preset'] = null;
+        }
+
+        return $state;
+    }
+
     public function wrapValue(mixed $value): mixed
     {
+        // A range's state is its keys, from the start: the picker binds into
+        // `.from` / `.to`, and a binding into a key of null throws.
         if ($this->range) {
-            return $value;
+            return $value ?? $this->emptyState();
         }
 
         return parent::wrapValue($value);
@@ -255,7 +530,9 @@ class DateFilter extends Filter
     public function getQueryStringFields(): array
     {
         if ($this->range) {
-            return ['from' => '_from', 'to' => '_to'];
+            return $this->hasPresets()
+                ? ['from' => '_from', 'to' => '_to', 'preset' => '_preset']
+                : ['from' => '_from', 'to' => '_to'];
         }
 
         return parent::getQueryStringFields();
@@ -267,6 +544,10 @@ class DateFilter extends Filter
      */
     protected function getIndicatorValueLabel(mixed $value): ?string
     {
+        if ($this->range && is_array($value) && ($preset = $this->presetFromState($value)) !== null) {
+            return $preset->label();
+        }
+
         if ($this->range && is_array($value)) {
             $from = ! empty($value['from']) ? (string) $value['from'] : null;
             $to = ! empty($value['to']) ? (string) $value['to'] : null;

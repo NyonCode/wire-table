@@ -66,6 +66,30 @@ return [
         | over this.
         */
         'inactive_rows' => null,
+
+        /*
+        | Where a column's header filter lives. 'row' (the default) draws a
+        | second header row with every filter always open; 'popover' puts a
+        | funnel beside each filterable column's label that opens the filter —
+        | the operator picker, the value and "Clear" — in a panel of its own (a
+        | bottom sheet on a phone), and marks the column while it is filtered.
+        | Per table: Table::columnFilterLayout(ColumnFilterLayout::Popover).
+        */
+        'column_filter_layout' => env('WIRE_TABLE_COLUMN_FILTER_LAYOUT', 'row'),
+
+        /*
+        | Where the filter panel (Table::filters()) is drawn: 'dropdown' behind
+        | the toolbar's Filters button (the default), 'above' always open above
+        | the rows, or 'above_collapsible' above the rows behind a toggle.
+        | Per table: Table::filtersLayout(FiltersLayout::AboveContent).
+        */
+        'filters_layout' => env('WIRE_TABLE_FILTERS_LAYOUT', 'dropdown'),
+
+        /*
+        | Apply the filter panel only when the user presses Apply, instead of on
+        | every change. Per table: Table::deferFilters().
+        */
+        'defer_filters' => env('WIRE_TABLE_DEFER_FILTERS', false),
     ],
 
     /*
