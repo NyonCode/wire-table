@@ -60,6 +60,30 @@ class QbTable extends Component
     }
 }
 
+class QbFacetTable extends Component
+{
+    use WithTable;
+
+    public function table(Table $table): Table
+    {
+        return $table
+            ->model(QbInvoice::class)
+            ->columns([TextColumn::make('customer')])
+            ->filters([
+                TextFilter::make('customer'),
+                QueryBuilderFilter::make('conditions')->constraints([
+                    SelectFilter::make('status')->optionsFromColumn(),
+                ]),
+            ])
+            ->paginated(false);
+    }
+
+    public function render(): string
+    {
+        return '<div>{{ $this->table }}</div>';
+    }
+}
+
 function qbBuilder(): QueryBuilderFilter
 {
     return QueryBuilderFilter::make('conditions')->constraints([
@@ -137,6 +161,41 @@ it('ignores conditions without a value, on an unknown field, or crafted', functi
         ->and(qbRun(['combinator' => 'and', 'rules' => [qbRule('secret', 'equals', 'x')]]))->toBe([1, 2, 3, 4])
         ->and(qbRun(['combinator' => 'xor', 'rules' => ['junk', qbRule('customer', 'equals', 'Beta')]]))->toBe([2])
         ->and(qbRun(['combinator' => 'and', 'rules' => [['combinator' => 'or', 'rules' => []]]]))->toBe([1, 2, 3, 4]);
+});
+
+it('caps a crafted tree: the number of conditions, and the size of their values', function () {
+    $many = array_fill(0, 500, qbRule('customer', 'contains', 'Acme'));
+    $normal = QueryBuilderState::normalize(['combinator' => 'and', 'rules' => [
+        ...array_slice($many, 0, 40),
+        ['combinator' => 'or', 'rules' => array_slice($many, 0, 40)],
+        // past the cap, nothing more is read — not even an empty group
+        ['combinator' => 'or', 'rules' => []],
+    ]]);
+
+    expect(QueryBuilderState::ruleCount($normal))->toBe(QueryBuilderState::MAX_RULES)
+        ->and(QueryBuilderState::ruleCount(['rules' => $many]))->toBe(QueryBuilderState::MAX_RULES)
+        // the group was cut to what was left
+        ->and($normal['rules'])->toHaveCount(41)
+        ->and($normal['rules'][40]['rules'])->toHaveCount(10);
+
+    $huge = QueryBuilderState::normalize(['rules' => [
+        qbRule('customer', 'contains', str_repeat('x', 5000)),
+        qbRule('status', 'in', [...array_fill(0, 300, 'paid'), ['nested'], str_repeat('y', 5000)]),
+        qbRule('customer', 'equals', ['deep' => ['er']]),
+        qbRule('customer', 'equals', new \stdClass),
+    ]]);
+
+    expect(mb_strlen($huge['rules'][0]['value']))->toBe(QueryBuilderState::MAX_VALUE_LENGTH)
+        ->and($huge['rules'][1]['value'])->toHaveCount(QueryBuilderState::MAX_VALUES)
+        ->and($huge['rules'][2]['value'])->toBe([])
+        ->and($huge['rules'][3]['value'])->toBeNull();
+
+    // At the cap, adding does nothing.
+    $full = ['combinator' => 'and', 'rules' => array_slice($many, 0, QueryBuilderState::MAX_RULES)];
+    expect(QueryBuilderState::addRule($full, 'customer', 'contains')['rules'])->toHaveCount(QueryBuilderState::MAX_RULES)
+        ->and(QueryBuilderState::addGroup($full, 'customer', 'contains')['rules'])->toHaveCount(QueryBuilderState::MAX_RULES)
+        ->and(QueryBuilderState::normalize(['rules' => [qbRule('status', 'in', [...array_fill(0, 3, 'x'), str_repeat('z', 2000)])]])['rules'][0]['value'][3])
+        ->toHaveLength(QueryBuilderState::MAX_VALUE_LENGTH);
 });
 
 it('words the active conditions as one chip', function () {
@@ -240,9 +299,10 @@ it('edits the tree through the component and narrows the rows', function () {
 
 // ─── Deferred panel and layouts ──────────────────────────────────────────
 
-it('binds without .live and shows Apply when the panel is deferred', function () {
+it('binds a deferred panel to a draft and shows Apply', function () {
     Livewire::test(QbTable::class, ['deferred' => true])
-        ->assertSeeHtml('wire:model="tableState.filters.customer.value"')
+        ->assertSeeHtml('wire:model="tableState.filterDraft.customer.value"')
+        ->assertSeeHtml('wire:model.live="tableState.filterDraft.conditions.combinator"')
         ->assertSeeHtml('data-testid="table-filters-apply"')
         ->call('applyTableFilters')
         ->assertOk();
@@ -250,6 +310,60 @@ it('binds without .live and shows Apply when the panel is deferred', function ()
     Livewire::test(QbTable::class)
         ->assertSeeHtml('wire:model.live.debounce.500ms="tableState.filters.customer.value"')
         ->assertDontSeeHtml('data-testid="table-filters-apply"');
+});
+
+function qbShown($component): array
+{
+    return $component->instance()->getTableRecords()->pluck('customer')->sort()->values()->all();
+}
+
+it('narrows nothing until Apply, however many requests the draft rides', function () {
+    $component = Livewire::test(QbTable::class, ['deferred' => true])
+        ->set('tableState.filterDraft.customer.value', 'Acme')
+        ->call('queryBuilderAddRule', 'conditions')
+        ->set('tableState.filterDraft.conditions.rules.0.field', 'status')
+        ->set('tableState.filterDraft.conditions.rules.0.value', ['paid'])
+        ->set('tableState.filterDraft.conditions.combinator', 'or')
+        // Another request in between — a sort — carries the draft and must not apply it.
+        ->call('sortTable', 'customer');
+
+    expect(qbShown($component))->toBe(['Acme', 'Acme East', 'Beta', 'Gamma'])
+        ->and($component->get('tableState.filters.customer.value'))->toBeNull()
+        ->and($component->get('tableState.filters.conditions'))->toBe(QueryBuilderState::empty());
+
+    $component->call('applyTableFilters');
+
+    // customer contains "Acme" AND (status is paid) — the builder's "any of" has one rule.
+    expect(qbShown($component))->toBe(['Acme'])
+        ->and($component->get('tableState.filterDraft'))->toBe($component->get('tableState.filters'));
+});
+
+it('takes the draft again when something else rewrites the filters', function () {
+    $component = Livewire::test(QbTable::class, ['deferred' => true])
+        ->set('tableState.filterDraft.customer.value', 'Beta')
+        ->call('applyTableFilters');
+
+    expect(qbShown($component))->toBe(['Beta']);
+
+    // An unapplied edit survives a request that leaves the filters alone …
+    $component->set('tableState.filterDraft.customer.value', 'Gamma')->call('sortTable', 'customer');
+    expect($component->get('tableState.filterDraft.customer.value'))->toBe('Gamma');
+
+    // … and Reset, which does not, starts the draft over from what it wrote.
+    $component->call('resetTableFilters');
+    expect(qbShown($component))->toBe(['Acme', 'Acme East', 'Beta', 'Gamma'])
+        ->and($component->get('tableState.filterDraft.customer.value'))->toBeNull();
+});
+
+it('applies a live panel at once and reads the filters, not a draft', function () {
+    $component = Livewire::test(QbTable::class)
+        ->call('queryBuilderAddRule', 'conditions');
+
+    expect($component->get('tableState.filterDraft'))->toBeNull()
+        ->and($component->get('tableState.filters.conditions.rules'))->toHaveCount(1);
+
+    // Apply on a live panel only goes back to the first page.
+    $component->call('applyTableFilters')->assertOk();
 });
 
 it('draws the filters above the rows, collapsible or always open', function () {
@@ -294,4 +408,18 @@ it('leaves out a constraint the user may not see — from the fields, the query 
         ->and($filter->hasActiveRule($state))->toBeFalse()
         ->and($filter->getIndicator($state))->toBeNull()
         ->and($filter->apply(QbInvoice::query(), $state)->count())->toBe(4);
+});
+
+it('lists and counts a builder field that takes its options from the data', function () {
+    $component = Livewire::test(QbFacetTable::class)
+        ->set('tableState.filters.customer', 'Acme')
+        ->call('queryBuilderAddRule', 'conditions')
+        ->set('tableState.filters.conditions.rules.0.field', 'status');
+
+    // Counted under the other filters (customer contains Acme), not the builder's own rules.
+    $status = $component->instance()->getTable()->getFilters()[1]->getConstraint('status');
+    expect($status->getFacets())->toEqual(['paid' => 1, 'overdue' => 1]);
+    // The values the data holds are the options; Beta's "pending" is not among them.
+    $component->assertSeeHtml('[\\u0022paid\\u0022,\\u0022paid\\u0022],[\\u0022overdue\\u0022,\\u0022overdue\\u0022]')
+        ->assertDontSeeHtml('\\u0022pending\\u0022');
 });

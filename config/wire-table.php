@@ -90,6 +90,15 @@ return [
         | every change. Per table: Table::deferFilters().
         */
         'defer_filters' => env('WIRE_TABLE_DEFER_FILTERS', false),
+
+        /*
+        | How long a select filter's option counts (SelectFilter::withCounts(),
+        | optionsFromColumn()) are kept, in seconds. A write through the table —
+        | an inline edit, an action — retires them at once; this bounds how long
+        | a write made anywhere else goes unseen. 0 counts on every request.
+        | A table with cacheQuery() keeps them as long as its rows.
+        */
+        'facet_cache_ttl' => env('WIRE_TABLE_FACET_CACHE_TTL', 60),
     ],
 
     /*
@@ -116,6 +125,20 @@ return [
     |   - \NyonCode\WireCore\Notifications\Drivers\FlasherDriver::class
     |
     */
+    /*
+    |--------------------------------------------------------------------------
+    | Export
+    |--------------------------------------------------------------------------
+    |
+    | The most rows a PDF export renders. A PDF cannot stream — its layout
+    | needs every row at once — so past this the export refuses and says to
+    | use CSV or a spreadsheet, which stream any size.
+    |
+    */
+    'export' => [
+        'pdf_max_rows' => env('WIRE_TABLE_PDF_MAX_ROWS', 5000),
+    ],
+
     'notification_driver' => null, // null = the driver wire-core.notifications.default names
 
     /*

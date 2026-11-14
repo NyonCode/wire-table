@@ -11,10 +11,10 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\ViewErrorBag;
 use NyonCode\WireCore\Core\Support\Trans;
+use NyonCode\WireCore\Foundation\Enums\DatePreset;
 use NyonCode\WireCore\Foundation\Support\DateBoundary;
 use NyonCode\WireForms\Components\DateRangePicker;
 use NyonCode\WireForms\Components\DateTimePicker;
-use NyonCode\WireTable\Enums\DatePreset;
 use NyonCode\WireTable\Enums\FilterOperator;
 
 class DateFilter extends Filter
@@ -192,7 +192,11 @@ class DateFilter extends Filter
         return $this->presets !== [];
     }
 
-    /** The timezone a preset's "today" is read in (defaults to the application's). */
+    /**
+     * The timezone days are read in (defaults to the application's): a
+     * preset's "today", and the bounds of a day on a column that holds a
+     * moment — see whereDay().
+     */
     public function timezone(?string $timezone): static
     {
         $this->timezone = $timezone;
@@ -323,11 +327,7 @@ class DateFilter extends Filter
     /** Days are before and after, not less and greater. */
     public function operatorLabel(FilterOperator $operator): string
     {
-        return match ($operator) {
-            FilterOperator::Equals, FilterOperator::NotEquals, FilterOperator::LessThan, FilterOperator::LessThanOrEqual,
-            FilterOperator::GreaterThan, FilterOperator::GreaterThanOrEqual => Trans::get('wire-table::messages.date_operator_'.$operator->value),
-            default => $operator->label(),
-        };
+        return $operator->dateLabel();
     }
 
     public function apply(Builder $query, mixed $value): Builder
@@ -354,17 +354,101 @@ class DateFilter extends Filter
             $range = $this->resolveRange($value);
 
             if (! empty($range['from'])) {
-                $query->whereDate($column, '>=', $range['from']);
+                $this->whereDay($query, $column, '>=', $range['from']);
             }
             if (! empty($range['to'])) {
-                $query->whereDate($column, '<=', $range['to']);
+                $this->whereDay($query, $column, '<=', $range['to']);
             }
+
+            return $query;
+        }
+
+        if (is_string($value)) {
+            $this->whereDay($query, $column, '=', $value);
 
             return $query;
         }
 
         /** @var Builder<Model> */
         return $query->whereDate($column, $value);
+    }
+
+    /**
+     * Compare a column with a calendar day.
+     *
+     * By DATE() as a rule — "on 3 March" matches 3 March at 14:00. The
+     * exception is a day read in another timezone than the one the application
+     * stores in ({@see timezone()}) on a column that holds a moment: DATE() of a
+     * UTC timestamp is the UTC day, so a row written at 23:30 in Prague would
+     * fall on the wrong side of midnight. There the day is the half-open range
+     * [its first moment, the next day's first moment) in the stored time —
+     * which an index on the column can also serve.
+     *
+     * @param  Builder<Model>  $query
+     * @param  '='|'>='|'>'|'<'|'<='  $operator
+     */
+    protected function whereDay(Builder $query, string $column, string $operator, mixed $day): void
+    {
+        $bounds = is_string($day) ? $this->dayBounds($query, $column, $day) : null;
+
+        if ($bounds === null) {
+            $operator === '=' ? $query->whereDate($column, $day) : $query->whereDate($column, $operator, $day);
+
+            return;
+        }
+
+        [$start, $next] = $bounds;
+
+        match ($operator) {
+            '>=' => $query->where($column, '>=', $start),
+            '>' => $query->where($column, '>=', $next),
+            '<' => $query->where($column, '<', $start),
+            '<=' => $query->where($column, '<', $next),
+            default => $query->where($column, '>=', $start)->where($column, '<', $next),
+        };
+    }
+
+    /**
+     * A day's first moment and the next day's, in the stored time — or null
+     * when DATE() is the right comparison: the filter reads days in the
+     * application's own timezone, or the column holds a date and not a moment.
+     *
+     * @param  Builder<Model>  $query
+     * @return array{0: string, 1: string}|null
+     */
+    protected function dayBounds(Builder $query, string $column, string $day): ?array
+    {
+        $stored = (string) config('app.timezone');
+
+        if ($this->timezone === null || $this->timezone === $stored || ! self::holdsMoments($query, $column)) {
+            return null;
+        }
+
+        $start = CarbonImmutable::createFromFormat('!Y-m-d', $day, $this->timezone);
+
+        if (! $start instanceof CarbonImmutable || $start->format('Y-m-d') !== $day) {
+            return null;
+        }
+
+        return [
+            $start->setTimezone($stored)->format('Y-m-d H:i:s'),
+            $start->addDay()->setTimezone($stored)->format('Y-m-d H:i:s'),
+        ];
+    }
+
+    /**
+     * Whether the column holds a moment — a datetime cast or one of the
+     * model's timestamps — rather than a calendar date.
+     *
+     * @param  Builder<Model>  $query
+     */
+    private static function holdsMoments(Builder $query, string $column): bool
+    {
+        $model = $query->getModel();
+        $attribute = str_contains($column, '.') ? substr($column, (int) strrpos($column, '.') + 1) : $column;
+
+        return in_array($attribute, $model->getDates(), true)
+            || $model->hasCast($attribute, ['datetime', 'immutable_datetime', 'custom_datetime', 'immutable_custom_datetime', 'timestamp']);
     }
 
     /**
@@ -376,25 +460,36 @@ class DateFilter extends Filter
      */
     protected function applyDateOperator(Builder $query, FilterOperator $operator, mixed $value): Builder
     {
-        $column = $this->getColumn();
-
-        if (! $operator->requiresValue()) {
-            $operator->constrain($query, $column, null);
-
+        if ($operator->requiresValue() && (! is_string($value) || $value === '')) {
             return $query;
         }
 
-        if (! is_string($value) || $value === '') {
-            return $query;
-        }
+        // Through applyComparison() so a dotted name ("customer.created_at")
+        // goes through the relation, and "is not on" / "is empty" across it are
+        // "no related record is on that day", like every other filter's.
+        return $this->applyComparison(
+            $query,
+            $operator,
+            fn (FilterOperator $op, Builder $q, string $column) => $this->constrainDate($op, $q, $column, $value),
+        );
+    }
 
-        return match ($operator) {
-            FilterOperator::NotEquals => $query->where(static fn (Builder $q) => $q->whereNull($column)->orWhereDate($column, '!=', $value)),
-            FilterOperator::LessThan => $query->whereDate($column, '<', $value),
-            FilterOperator::LessThanOrEqual => $query->whereDate($column, '<=', $value),
-            FilterOperator::GreaterThan => $query->whereDate($column, '>', $value),
-            FilterOperator::GreaterThanOrEqual => $query->whereDate($column, '>=', $value),
-            default => $query->whereDate($column, $value),
+    /**
+     * One date comparison on one column, by day.
+     *
+     * @param  Builder<Model>  $query
+     */
+    private function constrainDate(FilterOperator $operator, Builder $query, string $column, mixed $value): void
+    {
+        match ($operator) {
+            FilterOperator::IsEmpty, FilterOperator::IsNotEmpty => $operator->constrain($query, $column, null),
+            // "Is not on" keeps the rows with no date: NULL, or not on that day.
+            FilterOperator::NotEquals => $query->where(fn (Builder $q) => $q->whereNull($column)->orWhere(fn (Builder $q) => $q->whereNot(fn (Builder $q) => $this->whereDay($q, $column, '=', $value)))),
+            FilterOperator::LessThan => $this->whereDay($query, $column, '<', $value),
+            FilterOperator::LessThanOrEqual => $this->whereDay($query, $column, '<=', $value),
+            FilterOperator::GreaterThan => $this->whereDay($query, $column, '>', $value),
+            FilterOperator::GreaterThanOrEqual => $this->whereDay($query, $column, '>=', $value),
+            default => $this->whereDay($query, $column, '=', $value),
         };
     }
 

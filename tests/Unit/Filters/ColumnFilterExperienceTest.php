@@ -7,15 +7,16 @@ namespace NyonCode\WireTable\Tests\Unit\Filters;
 use Carbon\CarbonImmutable;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Livewire\Component;
 use Livewire\Livewire;
+use NyonCode\WireCore\Foundation\Enums\DatePreset;
 use NyonCode\WireTable\Columns\BooleanColumn;
 use NyonCode\WireTable\Columns\TextColumn;
 use NyonCode\WireTable\Concerns\WithTable;
 use NyonCode\WireTable\Data\CollectionDataSource;
 use NyonCode\WireTable\Enums\ColumnFilterLayout;
-use NyonCode\WireTable\Enums\DatePreset;
 use NyonCode\WireTable\Filters\DateFilter;
 use NyonCode\WireTable\Filters\Filter;
 use NyonCode\WireTable\Filters\NumberRangeFilter;
@@ -24,6 +25,7 @@ use NyonCode\WireTable\Filters\TernaryFilter;
 use NyonCode\WireTable\Filters\TextFilter;
 use NyonCode\WireTable\Services\FilterFacets;
 use NyonCode\WireTable\Services\TableQueryService;
+use NyonCode\WireTable\Services\WriteGeneration;
 use NyonCode\WireTable\Table;
 
 class CfxPerson extends Model
@@ -142,6 +144,36 @@ it('reads "today" in the filter timezone', function () {
 
 // ─── Counts and the value list ───────────────────────────────────────────
 
+it('reads a day in the filter timezone on a timestamp, and by DATE() on a date', function () {
+    config()->set('app.timezone', 'UTC');
+    // 23:30 UTC on the 11th is 00:30 on the 12th in Prague; 23:30 UTC on the 12th is the 13th there.
+    CfxPerson::query()->whereKey(1)->update(['created_at' => '2026-11-11 23:30:00', 'joined_on' => '2026-11-12']);
+    CfxPerson::query()->whereKey(2)->update(['created_at' => '2026-11-12 23:30:00', 'joined_on' => '2026-11-12']);
+    CfxPerson::query()->whereKey(3)->update(['created_at' => '2026-11-12 10:00:00', 'joined_on' => '2026-11-13']);
+
+    $names = function (DateFilter $filter, mixed $state): array {
+        $query = CfxPerson::query();
+        $filter->forState($state)->apply($query, $filter->forState($state)->extractValue($state));
+
+        return $query->orderBy('id')->pluck('name')->all();
+    };
+    $prague = fn (string $column): DateFilter => DateFilter::make($column)->timezone('Europe/Prague');
+
+    expect($names($prague('created_at'), '2026-11-12'))->toBe(['Ada', 'Cy'])
+        ->and($names($prague('created_at')->range(), ['from' => '2026-11-13', 'to' => '2026-11-13']))->toBe(['Bo'])
+        ->and($names($prague('created_at')->operators(), ['value' => '2026-11-12', 'operator' => 'not_equals']))->toBe(['Bo'])
+        ->and($names($prague('created_at')->operators(), ['value' => '2026-11-12', 'operator' => 'gt']))->toBe(['Bo'])
+        ->and($names($prague('created_at')->operators(), ['value' => '2026-11-12', 'operator' => 'lt']))->toBe([])
+        ->and($names($prague('created_at')->operators(), ['value' => '2026-11-12', 'operator' => 'lte']))->toBe(['Ada', 'Cy'])
+        ->and($names($prague('created_at')->operators(), ['value' => '2026-11-13', 'operator' => 'gte']))->toBe(['Bo'])
+        // A date column has no moment to shift: still DATE().
+        ->and($names($prague('joined_on'), '2026-11-12'))->toBe(['Ada', 'Bo'])
+        // Read in the application's own timezone, DATE() is right as it is.
+        ->and($names(DateFilter::make('created_at'), '2026-11-12'))->toBe(['Bo', 'Cy'])
+        // A malformed day is not shifted, just compared.
+        ->and($names($prague('created_at'), '2026-02-31'))->toBe([]);
+});
+
 it('counts each option under the other filters, never under its own', function () {
     $table = Table::make()->model(CfxPerson::class);
     $role = SelectFilter::make('role')->multiple()->options(['admin' => 'Admin', 'editor' => 'Editor', 'viewer' => 'Viewer'])->withCounts();
@@ -154,6 +186,54 @@ it('counts each option under the other filters, never under its own', function (
         ->and($role->facets($all)->getDisplayOptions())->toBe(['admin' => 'Admin (1)', 'editor' => 'Editor (2)', 'viewer' => 'Viewer (0)'])
         // The chip keeps the plain label.
         ->and($role->getIndicator(['value' => ['admin']]))->toBe('Role: Admin');
+});
+
+it('keeps the counts until the table writes, and counts afresh with no scope', function () {
+    $table = Table::make()->model(CfxPerson::class);
+    $role = SelectFilter::make('role')->withCounts();
+    $count = fn (?string $scope, int $ttl = 60, ?string $owner = 'component-a'): ?array => app(FilterFacets::class)->count($table, $role, [], [], null, 'role', false, cacheScope: $scope, ttl: $ttl, cacheOwner: $owner);
+
+    expect($count(CfxPerson::class))->toBe(['editor' => 2, 'admin' => 1]);
+
+    // A write the table did not make goes unseen until the TTL …
+    CfxPerson::create(['id' => 4, 'name' => 'Di', 'role' => 'admin']);
+    expect($count(CfxPerson::class))->toBe(['editor' => 2, 'admin' => 1])
+        // … unless nothing is kept at all.
+        ->and($count(null))->toEqual(['admin' => 2, 'editor' => 2])
+        ->and($count(CfxPerson::class, ttl: 0))->toEqual(['admin' => 2, 'editor' => 2])
+        // … and never another viewer's: equal SQL is not equal data (a tenant
+        // on its own database or schema), so nothing is shared between owners.
+        ->and($count(CfxPerson::class, owner: 'component-b'))->toEqual(['admin' => 2, 'editor' => 2])
+        ->and($count(CfxPerson::class, owner: null))->toEqual(['admin' => 2, 'editor' => 2]);
+
+    // A write through the table moves the generation and retires them.
+    app(WriteGeneration::class)->bump(CfxPerson::class);
+    expect($count(CfxPerson::class))->toEqual(['admin' => 2, 'editor' => 2]);
+});
+
+it('runs the grouped count once, not on every request, until the table writes', function () {
+    $grouped = 0;
+    DB::listen(function ($query) use (&$grouped): void {
+        if (str_contains($query->sql, 'wire_facet_count')) {
+            $grouped++;
+        }
+    });
+
+    $component = Livewire::test(CfxTable::class);
+    $first = $grouped;
+
+    $component->call('$refresh')->call('$refresh');
+    expect($first)->toBeGreaterThan(0)
+        ->and($grouped)->toBe($first);
+
+    $component->call('invalidateTable');
+    expect($grouped)->toBeGreaterThan($first);
+});
+
+it('knows whether any of its select filters counts', function () {
+    expect(Table::make()->filters([SelectFilter::make('role')->withCounts()])->hasFilterFacets())->toBeTrue()
+        ->and(Table::make()->columns([TextColumn::make('city')->filterAsValueList()])->hasFilterFacets())->toBeTrue()
+        ->and(Table::make()->filters([SelectFilter::make('role')])->columns([TextColumn::make('city')->filterable()])->hasFilterFacets())->toBeFalse();
 });
 
 it('does not count a relation, a dotted column or a custom data source', function () {
@@ -283,4 +363,9 @@ it('lists no values and filters by no hidden cell for a column that hides some c
 
     $component->call('filterByCellValue', '1', 'city');
     expect($component->get('tableState.columnFilters.city'))->toBe(['Praha']);
+});
+
+it('lists the presets it offers', function () {
+    expect(DateFilter::make('joined_on')->presets([DatePreset::Today])->getPresets())->toBe([DatePreset::Today])
+        ->and(DateFilter::make('joined_on')->getPresets())->toBe([]);
 });

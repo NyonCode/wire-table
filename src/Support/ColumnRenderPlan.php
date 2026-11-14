@@ -6,6 +6,7 @@ namespace NyonCode\WireTable\Support;
 
 use NyonCode\WireCore\Foundation\View\Skeleton;
 use NyonCode\WireTable\Columns\Column;
+use NyonCode\WireTable\Contracts\RendersCellPanel;
 use NyonCode\WireTable\Contracts\ShowsTableColumns;
 use NyonCode\WireTable\Enums\ColumnFilterLayout;
 use NyonCode\WireTable\Table;
@@ -64,6 +65,15 @@ final class ColumnRenderPlan
         public readonly bool $hasToggles,
         public readonly array $mobileSortable,
         public readonly bool $hasMobileSort,
+        // Whether any column is pinned to the start (Column::pinned(), or the
+        // user's own through Table::pinnableColumns()) — the selection column
+        // then sticks with them, and wire-table-columns.js measures the offsets.
+        public readonly bool $hasPinned = false,
+        public readonly bool $isResizable = false,
+        /** @var list<string> Names of the pinned columns, in the order they are drawn. */
+        public readonly array $pinnedNames = [],
+        /** @var list<RendersCellPanel> Visible columns whose cells share markup drawn once. */
+        public readonly array $cellPanels = [],
     ) {}
 
     /**
@@ -77,6 +87,17 @@ final class ColumnRenderPlan
             $table->getColumns(),
             fn ($c) => $c->canView() && $component->isColumnVisible($c->getName()),
         );
+
+        // Pinned columns are drawn first, in their declared order: a column
+        // stuck to the start of the table has to BE at the start, or the ones
+        // before it would scroll underneath it. Keys are kept.
+        // A host that predates the user's own pins and widths (a component of an
+        // application's own over ShowsTableColumns) still gets the declared pins.
+        $pinned = is_callable([$component, 'isColumnPinned'])
+            ? array_filter($visible, fn ($c) => (bool) call_user_func([$component, 'isColumnPinned'], $c))
+            : array_filter($visible, fn ($c) => $c->isPinned());
+        $visible = $pinned + $visible;
+        $widths = is_callable([$component, 'tableColumnWidths']) ? (array) call_user_func([$component, 'tableColumnWidths']) : [];
 
         // Sub-rows render through the same column partials, so their columns are
         // resolved here too — but only when the table has any.
@@ -112,7 +133,7 @@ final class ColumnRenderPlan
         return new self(
             visible: $visible,
             hasVisible: count($visible) > 0,
-            meta: self::meta($table, $visible),
+            meta: self::meta($table, $visible, array_map(fn ($c) => $c->getName(), $pinned), $widths),
             fillable: $fillable,
             isFillEnabled: $table->isFillHandleEnabled() && $fillable !== [],
             filterable: $filterable,
@@ -138,6 +159,10 @@ final class ColumnRenderPlan
             hasToggles: count($toggleable) > 0,
             mobileSortable: $mobileSortable,
             hasMobileSort: count($mobileSortable) > 0,
+            hasPinned: $pinned !== [],
+            isResizable: $table->hasResizableColumns(),
+            pinnedNames: array_values(array_map(fn ($c) => $c->getName(), $pinned)),
+            cellPanels: array_values(array_filter($visible, fn ($c) => $c instanceof RendersCellPanel)),
         );
     }
 
@@ -160,8 +185,16 @@ final class ColumnRenderPlan
      * @param  array<int, Column>  $visible
      * @return array<string, array<string, mixed>>
      */
-    private static function meta(Table $table, array $visible): array
+    /**
+     * @param  array<int, Column>  $visible
+     * @param  array<int, string>  $pinned  names of the pinned columns
+     * @param  array<string, int>  $widths  user widths in px, by column name
+     * @return array<string, array<string, mixed>>
+     */
+    private static function meta(Table $table, array $visible, array $pinned = [], array $widths = []): array
     {
+        $sticky = StickyColumn::on('start');
+
         $cellPadding = $table->getCellPadding();
         $borderClass = $table->isBordered()
             ? 'border border-gray-200 dark:border-gray-700'
@@ -178,7 +211,11 @@ final class ColumnRenderPlan
                 'responsive' => $column->getResponsiveClasses(),
                 'editable' => $column->isEditable(),
                 'responsiveDisplay' => $column->hasResponsiveDisplay(),
-                'widthStyles' => $column->getWidthStyles(),
+                // A width the user dragged wins over the declared one.
+                'widthStyles' => isset($widths[$name])
+                    ? 'width: '.$widths[$name].'px; min-width: '.$widths[$name].'px'
+                    : $column->getWidthStyles(),
+                'pinned' => in_array($name, $pinned, true),
                 // Author-supplied cell/header attributes, resolved here with the
                 // rest of the column-static metadata rather than per cell.
                 'extraCell' => $column->getExtraAttributes(),
@@ -196,6 +233,7 @@ final class ColumnRenderPlan
                     'responsive' => $entry['responsive'],
                     'name' => $name,
                     'extraAttributes' => $entry['extraCell'],
+                    'pinned' => $entry['pinned'] ? $sticky : null,
                     'content' => Skeleton::slot('content'),
                 ])->render(),
                 'content',

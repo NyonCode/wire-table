@@ -34,6 +34,7 @@ use NyonCode\WireCore\Core\Support\Trans;
 use NyonCode\WireCore\Foundation\Concerns\InteractsWithPartials;
 use NyonCode\WireCore\Foundation\Enums\Hook;
 use NyonCode\WireCore\Foundation\Preferences\Contracts\PreferenceDriver;
+use NyonCode\WireCore\Foundation\Preferences\Contracts\SharesViews;
 use NyonCode\WireCore\Notifications\Notification;
 use NyonCode\WireForms\Concerns\DispatchesStateUpdates;
 use NyonCode\WireForms\Concerns\InteractsWithActionForms;
@@ -54,6 +55,7 @@ use NyonCode\WireTable\Export\Jobs\RunExportJob;
 use NyonCode\WireTable\Export\TableExport;
 use NyonCode\WireTable\Filters\DateFilter;
 use NyonCode\WireTable\Filters\Filter;
+use NyonCode\WireTable\Filters\QueryBuilderFilter;
 use NyonCode\WireTable\Filters\SelectFilter;
 use NyonCode\WireTable\Import\ImportAction;
 use NyonCode\WireTable\Import\ImportColumn;
@@ -72,6 +74,7 @@ use NyonCode\WireTable\Services\TableQueryEvents;
 use NyonCode\WireTable\Services\TableQueryService;
 use NyonCode\WireTable\Services\WriteGeneration;
 use NyonCode\WireTable\Support\CellEditOutcome;
+use NyonCode\WireTable\Support\ColumnLayout;
 use NyonCode\WireTable\Support\PollCommit;
 use NyonCode\WireTable\Support\RowRenderer;
 use NyonCode\WireTable\Support\RowStamps;
@@ -113,7 +116,9 @@ trait WithTable
         InteractsWithTableActions::afterActionExecuted insteadof InteractsWithActions;
         InteractsWithTableActions::resolveActionRecordIds insteadof InteractsWithActions;
         InteractsWithTableActions::sendActionNotification insteadof InteractsWithActions;
+        InteractsWithTableActions::offerActionUndo insteadof InteractsWithActions;
     }
+    use InteractsWithColumnLayout;
     use InteractsWithFieldActions;
     use InteractsWithFileUploads;
 
@@ -267,29 +272,7 @@ trait WithTable
         // resetting is this host's job. See StateInvalidation for the rules,
         // including why a re-sort leaves the selection alone and a filter does
         // not.
-        $invalidated = StateInvalidation::forPath($path);
-
-        if ($invalidated !== null) {
-            if ($invalidated->normalisesPerPage) {
-                $this->normalizePerPage();
-            }
-
-            if ($invalidated->marksViewChanged) {
-                $this->markTableViewChanged();
-            }
-
-            if ($invalidated->resetsSelectionScope) {
-                $this->resetSelectionScope();
-            }
-
-            if ($invalidated->resetsPage) {
-                $this->resetPage();
-            }
-
-            if ($invalidated->clearsCursor) {
-                $this->tableState->set('pagination.cursor', null);
-            }
-
+        if ($this->invalidateTableStateFor($path)) {
             return;
         }
 
@@ -895,6 +878,7 @@ trait WithTable
         // the plan agrees with the view either way.
         if ($this->renderPlan === null) {
             $this->resolveDatePresets();
+            $this->syncTableFilterDraft();
             $this->countFilterOptions();
         }
 
@@ -917,7 +901,15 @@ trait WithTable
     {
         $table = $this->getTable();
 
-        foreach (['filters' => $table->getFilters(), 'columnFilters' => array_filter(array_map(fn ($column) => $column->getFilter(), $table->getColumns()))] as $key => $filters) {
+        $sources = ['filters' => $table->getFilters(), 'columnFilters' => array_filter(array_map(fn ($column) => $column->getFilter(), $table->getColumns()))];
+
+        // A deferred panel's picker draws the draft, so a preset chosen there
+        // needs its dates worked out there too.
+        if ($table->hasDeferredFilters() && is_array($this->tableState->get('filterDraft'))) {
+            $sources['filterDraft'] = $sources['filters'];
+        }
+
+        foreach ($sources as $key => $filters) {
             $state = $this->tableState->get($key, []);
             $changed = false;
 
@@ -957,6 +949,10 @@ trait WithTable
         }
 
         $facets = null;
+        $scope = $this->queryCacheScope($table);
+        $ttl = $table->getQueryCacheTtl() ?? (int) config('wire-table.defaults.facet_cache_ttl', 60);
+        // Kept for this component instance only — see FilterFacets.
+        $owner = $this instanceof Component ? static::class.':'.$this->getId() : null;
         $filterValues = $this->tableState->get('filters', []);
         $columnFilterValues = $this->tableState->get('columnFilters', []);
         $search = $this->tableState->get('search');
@@ -964,7 +960,19 @@ trait WithTable
         foreach ($table->getFilters() as $filter) {
             if ($filter instanceof SelectFilter && $filter->wantsFacets() && $filter->canView()) {
                 $facets ??= app(FilterFacets::class);
-                $filter->facets($facets->count($table, $filter, $filterValues, $columnFilterValues, $search, $filter->getName(), isColumnFilter: false));
+                $filter->facets($facets->count($table, $filter, $filterValues, $columnFilterValues, $search, $filter->getName(), isColumnFilter: false, cacheScope: $scope, ttl: $ttl, cacheOwner: $owner));
+            }
+
+            // A query builder's select fields list and count their values too —
+            // over the table as everything but the builder narrows it, the same
+            // rule a panel filter is counted by.
+            if ($filter instanceof QueryBuilderFilter && $filter->canView()) {
+                foreach ($filter->getConstraints() as $constraint) {
+                    if ($constraint instanceof SelectFilter && $constraint->wantsFacets()) {
+                        $facets ??= app(FilterFacets::class);
+                        $constraint->facets($facets->count($table, $constraint, $filterValues, $columnFilterValues, $search, $filter->getName(), isColumnFilter: false, cacheScope: $scope, ttl: $ttl, cacheOwner: $owner));
+                    }
+                }
             }
         }
 
@@ -975,7 +983,7 @@ trait WithTable
             // values listed (and counted) here for anyone to read — no facets.
             if ($filter instanceof SelectFilter && $filter->wantsFacets() && $filter->canView() && $column->canView() && ! $column->hasRecordVisibility()) {
                 $facets ??= app(FilterFacets::class);
-                $filter->facets($facets->count($table, $filter, $filterValues, $columnFilterValues, $search, $column->getName(), isColumnFilter: true));
+                $filter->facets($facets->count($table, $filter, $filterValues, $columnFilterValues, $search, $column->getName(), isColumnFilter: true, cacheScope: $scope, ttl: $ttl, cacheOwner: $owner));
             }
         }
     }
@@ -1417,9 +1425,10 @@ trait WithTable
     {
         $table = $this->getTable();
 
-        // Only the two readers care, and a bump is a write to the shared cache
-        // store: a table that neither caches nor polls has nobody to tell.
-        if (! $table->isQueryCached() && ! $table->isPolling()) {
+        // Only the readers care, and a bump is a write to the shared cache
+        // store: a table that neither caches, polls nor counts filter options
+        // has nobody to tell.
+        if (! $table->isQueryCached() && ! $table->isPolling() && ! $table->hasFilterFacets()) {
             return;
         }
 
@@ -1585,13 +1594,112 @@ trait WithTable
     }
 
     /**
-     * Apply a deferred filter panel (Table::deferFilters()). The values it holds
-     * arrive with this very request — the controls bind without `.live` — so
-     * all that is left is to start again from the first page.
+     * Apply a deferred filter panel (Table::deferFilters()): the draft its
+     * controls wrote becomes the filters the query reads, and the list starts
+     * again from the first page.
+     *
+     * Until this runs nothing the panel holds narrows the rows — not the
+     * values, not a query builder's fields or groups — however many other
+     * requests (a page, a sort, a poll, a row action) go in between.
      */
     public function applyTableFilters(): void
     {
-        $this->resetPage();
+        $draft = $this->getTable()->hasDeferredFilters() ? $this->tableState->get('filterDraft') : null;
+
+        if (! is_array($draft)) {
+            $this->resetPage();
+
+            return;
+        }
+
+        // The same write a live panel makes control by control, made at once —
+        // and so the same consequences: the selection scope, the page, the
+        // cursor, the view marked changed.
+        $this->tableState->set('filters', $draft);
+        $this->invalidateTableStateFor('filters');
+    }
+
+    /**
+     * Do what a write to this table-state path invalidates (see
+     * {@see StateInvalidation}). False when the path invalidates nothing.
+     */
+    protected function invalidateTableStateFor(string $path): bool
+    {
+        $invalidated = StateInvalidation::forPath($path);
+
+        if ($invalidated === null) {
+            return false;
+        }
+
+        if ($invalidated->normalisesPerPage) {
+            $this->normalizePerPage();
+        }
+
+        if ($invalidated->marksViewChanged) {
+            $this->markTableViewChanged();
+        }
+
+        if ($invalidated->resetsSelectionScope) {
+            $this->resetSelectionScope();
+        }
+
+        if ($invalidated->resetsPage) {
+            $this->resetPage();
+        }
+
+        if ($invalidated->clearsCursor) {
+            $this->tableState->set('pagination.cursor', null);
+        }
+
+        return true;
+    }
+
+    /**
+     * The state key a panel filter's control writes to — the filters
+     * themselves, or the draft of a deferred panel.
+     */
+    protected function tableFilterPanelStateKey(): string
+    {
+        return $this->getTable()->hasDeferredFilters() ? 'filterDraft' : 'filters';
+    }
+
+    /**
+     * The values the filter panel draws: what its controls are bound to.
+     *
+     * @return array<string, mixed>
+     */
+    public function getTableFilterPanelValues(): array
+    {
+        $values = $this->tableState->get($this->tableFilterPanelStateKey(), []);
+
+        return is_array($values) ? $values : [];
+    }
+
+    /**
+     * Take the draft of a deferred panel again whenever the applied filters
+     * are no longer the ones it was taken from.
+     *
+     * The fingerprint is what keeps this from needing every writer of the
+     * filters to know about the draft: Reset, a chip's remove, a saved view,
+     * a link, Apply itself — each rewrites 'filters', and the next render
+     * notices and starts the draft over from them. A user's unapplied edits
+     * survive every request that leaves the filters alone.
+     */
+    protected function syncTableFilterDraft(): void
+    {
+        if (! $this->getTable()->hasDeferredFilters()) {
+            return;
+        }
+
+        $filters = $this->tableState->get('filters', []) ?? [];
+        $fingerprint = md5(serialize($filters));
+
+        if ($this->tableState->get('filterDraftOf') === $fingerprint && is_array($this->tableState->get('filterDraft'))) {
+            return;
+        }
+
+        $this->tableState->set('filterDraft', $filters);
+        $this->tableState->set('filterDraftOf', $fingerprint);
     }
 
     /**
@@ -2180,7 +2288,7 @@ trait WithTable
      * has to be one answer shared with {@see applyTableView()}, or a view would
      * restore something other than what was saved.
      */
-    public function saveTableView(string $name): void
+    public function saveTableView(string $name, bool $shared = false): void
     {
         $name = trim($name);
         $key = $this->getTable()->getSavedViewsKey();
@@ -2192,18 +2300,70 @@ trait WithTable
             return;
         }
 
+        // A shared view is a row with no user, which everyone reads — so it is
+        // written only by someone the table lets publish one.
+        if ($shared ? ! $this->canShareTableViews() : ! $this->hasOwnTableViews()) {
+            return;
+        }
+
         $this->resolvePreferenceDriver($this->getTable())->save(
             $key,
-            $this->preferenceUser(),
+            $shared ? null : $this->preferenceUser(),
             TableViewPayload::capture($this->tableState),
             $name,
         );
     }
 
     /**
+     * Whether this user has views of their own to keep. Not a guest over a
+     * store that has an "everyone" ({@see SharesViews}): a guest's row has no
+     * user, and a row with no user IS the shared view — saving "my view" there
+     * would publish it to every user of the table, and deleting one would take
+     * a shared view down.
+     */
+    protected function hasOwnTableViews(): bool
+    {
+        return $this->preferenceUser() !== null
+            || ! $this->resolvePreferenceDriver($this->getTable()) instanceof SharesViews;
+    }
+
+    /**
+     * Whether this user may publish and delete views everyone sees
+     * ({@see Table::shareViews()}) — through a store that has an "everyone".
+     */
+    public function canShareTableViews(): bool
+    {
+        $table = $this->getTable();
+
+        return $table->mayShareViews($this->preferenceUser())
+            && $this->resolvePreferenceDriver($table) instanceof SharesViews;
+    }
+
+    /**
+     * The names of the views shared with every user of this table.
+     *
+     * @return array<int, string>
+     */
+    public function getSharedTableViews(): array
+    {
+        $table = $this->getTable();
+        $key = $table->getSavedViewsKey();
+
+        // A guest's own views are the user-less rows already: listing them
+        // again as "shared" would show each one twice.
+        if ($key === null || ! $table->sharesViews() || $this->preferenceUser() === null) {
+            return [];
+        }
+
+        $driver = $this->resolvePreferenceDriver($table);
+
+        return $driver instanceof SharesViews ? $driver->views($key, null) : [];
+    }
+
+    /**
      * Restore a saved view onto the current table state.
      */
-    public function applyTableView(string $name): void
+    public function applyTableView(string $name, bool $shared = false): void
     {
         $table = $this->getTable();
         $key = $table->getSavedViewsKey();
@@ -2212,7 +2372,11 @@ trait WithTable
             return;
         }
 
-        $payload = $this->resolvePreferenceDriver($table)->load($key, $this->preferenceUser(), $name);
+        if ($shared ? ! in_array($name, $this->getSharedTableViews(), true) : ! $this->hasOwnTableViews()) {
+            return;
+        }
+
+        $payload = $this->resolvePreferenceDriver($table)->load($key, $shared ? null : $this->preferenceUser(), $name);
 
         if ($payload === []) {
             return;
@@ -2234,7 +2398,7 @@ trait WithTable
     /**
      * Delete a saved view. The current layout is untouched.
      */
-    public function deleteTableView(string $name): void
+    public function deleteTableView(string $name, bool $shared = false): void
     {
         $key = $this->getTable()->getSavedViewsKey();
 
@@ -2242,7 +2406,11 @@ trait WithTable
             return;
         }
 
-        $this->resolvePreferenceDriver($this->getTable())->forget($key, $this->preferenceUser(), $name);
+        if ($shared ? ! $this->canShareTableViews() : ! $this->hasOwnTableViews()) {
+            return;
+        }
+
+        $this->resolvePreferenceDriver($this->getTable())->forget($key, $shared ? null : $this->preferenceUser(), $name);
     }
 
     /**
@@ -2254,7 +2422,7 @@ trait WithTable
     {
         $key = $this->getTable()->getSavedViewsKey();
 
-        if ($key === null) {
+        if ($key === null || ! $this->hasOwnTableViews()) {
             return [];
         }
 
@@ -2307,6 +2475,9 @@ trait WithTable
             'columns.hidden',
             array_values(array_intersect($storedHidden, $toggleable)),
         );
+
+        $this->tableState->set('columns.widths', ColumnLayout::widths($preferences['columns']['widths'] ?? [], $table));
+        $this->tableState->set('columns.pinned', ColumnLayout::pins($preferences['columns']['pinned'] ?? [], $table));
     }
 
     /**
@@ -2324,6 +2495,8 @@ trait WithTable
         $this->resolvePreferenceDriver($table)->save($key, $this->preferenceUser(), [
             'columns' => [
                 'hidden' => array_values($this->tableState->get('columns.hidden', [])),
+                'widths' => $this->tableColumnWidths(),
+                'pinned' => $this->userPinnedColumns(),
             ],
             'rows' => [
                 'expandAll' => $this->tableState->get('rows.expandAll'),

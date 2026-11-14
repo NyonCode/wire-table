@@ -18,6 +18,8 @@ return [
     'fill_partial' => 'Uloženo :filled z :total řádků',
     'fill_handle' => 'Tažením vyplníte řádky níže',
     'select_placeholder' => 'Vyberte...',
+    'select_invalid_option' => 'Vyberte jednu z možností.',
+    'select_required' => 'Vyberte možnost.',
     'from' => 'Od',
     'to' => 'Do',
     'confirm_heading' => 'Potvrdit akci',
@@ -89,17 +91,6 @@ return [
     'query_builder_empty' => 'Zatím žádné podmínky.',
     'date_preset_label' => 'Období pro :filter',
     'date_preset_custom' => 'Vlastní data',
-    'date_preset_today' => 'Dnes',
-    'date_preset_yesterday' => 'Včera',
-    'date_preset_last_7_days' => 'Posledních 7 dní',
-    'date_preset_last_30_days' => 'Posledních 30 dní',
-    'date_preset_this_week' => 'Tento týden',
-    'date_preset_last_week' => 'Minulý týden',
-    'date_preset_this_month' => 'Tento měsíc',
-    'date_preset_last_month' => 'Minulý měsíc',
-    'date_preset_this_quarter' => 'Toto čtvrtletí',
-    'date_preset_this_year' => 'Tento rok',
-    'date_preset_last_year' => 'Minulý rok',
     'filter_only_value' => 'Jen tato hodnota',
     'filter_exclude_value' => 'Vyloučit tuto hodnotu',
 
@@ -226,4 +217,26 @@ return [
     'export_queued' => 'Export se připravuje na pozadí.',
     'export_ready' => 'Export je hotový: :file',
     'unsaved_edits' => 'Některé změny ještě nejsou uložené. Opravdu odejít?',
+
+    // BulkEditAction
+    'bulk_edit_label' => 'Upravit vybrané',
+    'bulk_edit_heading' => 'Upravit vybrané záznamy',
+    'bulk_edit_submit' => 'Použít',
+    'bulk_edit_change' => 'Změnit :field',
+    'bulk_edit_done' => '{0} Nic se nezměnilo.|{1} Upraven :count záznam.|[2,4] Upraveny :count záznamy.|[5,*] Upraveno :count záznamů.',
+    'bulk_edit_skipped' => '{1} :count záznam zůstal beze změny: nemáte oprávnění ho upravit.|[2,4] :count záznamy zůstaly beze změny: nemáte oprávnění je upravit.|[5,*] :count záznamů zůstalo beze změny: nemáte oprávnění je upravit.',
+
+    // Shared views (Table::shareViews())
+    'shared_view' => 'Sdíleno se všemi',
+    'save_shared_view' => 'Uložit pro všechny',
+
+    // Undo (BaseAction::undoable())
+    'undo' => 'Zpět',
+    'undo_deleted' => '{1} Smazán :count záznam.|[2,4] Smazány :count záznamy.|[5,*] Smazáno :count záznamů.',
+    'undo_restored' => '{0} Nebylo co obnovit.|{1} Obnoven :count záznam.|[2,4] Obnoveny :count záznamy.|[5,*] Obnoveno :count záznamů.',
+
+    // Column layout (Table::resizableColumns(), Table::pinnableColumns())
+    'resize_column' => 'Změnit šířku sloupce :column',
+    'pin_column' => 'Připnout na začátek',
+    'pinned_columns' => 'Připnuté sloupce',
 ];

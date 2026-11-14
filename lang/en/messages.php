@@ -18,6 +18,8 @@ return [
     'fill_partial' => ':filled of :total rows saved',
     'fill_handle' => 'Drag to fill the rows below',
     'select_placeholder' => 'Select...',
+    'select_invalid_option' => 'Choose one of the options.',
+    'select_required' => 'Choose an option.',
     'from' => 'From',
     'to' => 'To',
     'confirm_heading' => 'Confirm action',
@@ -89,17 +91,6 @@ return [
     'query_builder_empty' => 'No conditions yet.',
     'date_preset_label' => 'Date range for :filter',
     'date_preset_custom' => 'Custom dates',
-    'date_preset_today' => 'Today',
-    'date_preset_yesterday' => 'Yesterday',
-    'date_preset_last_7_days' => 'Last 7 days',
-    'date_preset_last_30_days' => 'Last 30 days',
-    'date_preset_this_week' => 'This week',
-    'date_preset_last_week' => 'Last week',
-    'date_preset_this_month' => 'This month',
-    'date_preset_last_month' => 'Last month',
-    'date_preset_this_quarter' => 'This quarter',
-    'date_preset_this_year' => 'This year',
-    'date_preset_last_year' => 'Last year',
     'filter_only_value' => 'Only this value',
     'filter_exclude_value' => 'Exclude this value',
 
@@ -226,4 +217,26 @@ return [
     'export_queued' => 'The export is being prepared in the background.',
     'export_ready' => 'Your export is ready: :file',
     'unsaved_edits' => 'Some changes have not been saved yet. Leave anyway?',
+
+    // BulkEditAction
+    'bulk_edit_label' => 'Edit selected',
+    'bulk_edit_heading' => 'Edit the selected records',
+    'bulk_edit_submit' => 'Apply',
+    'bulk_edit_change' => 'Change :field',
+    'bulk_edit_done' => '{0} Nothing was changed.|{1} :count record updated.|[2,*] :count records updated.',
+    'bulk_edit_skipped' => '{1} :count was left alone: you may not edit it.|[2,*] :count were left alone: you may not edit them.',
+
+    // Shared views (Table::shareViews())
+    'shared_view' => 'Shared with everyone',
+    'save_shared_view' => 'Save for everyone',
+
+    // Undo (BaseAction::undoable())
+    'undo' => 'Undo',
+    'undo_deleted' => '{1} :count record deleted.|[2,*] :count records deleted.',
+    'undo_restored' => '{0} Nothing to restore.|{1} :count record restored.|[2,*] :count records restored.',
+
+    // Column layout (Table::resizableColumns(), Table::pinnableColumns())
+    'resize_column' => 'Resize the :column column',
+    'pin_column' => 'Pin to the start',
+    'pinned_columns' => 'Pinned columns',
 ];
