@@ -25,7 +25,9 @@
     // Hoisted: a directive expression with nested parentheses sends Livewire's morph
     // marker injector down its paren-repair path, which can swallow a neighbouring
     // directive's opening marker — see the note in sub-rows.blade.php.
-    $hasExpanderSpacer = $table->hasSubRows() && $table->isSubRowsExpandable();
+    // The spacer follows the expander cell the rows draw — present on a page
+    // where some record gets sub-rows, toggle or not (ShellRenderPlan::$hasExpanderColumn).
+    $hasExpanderSpacer = $hasExpanderColumn ?? $table->hasSubRows();
     $groupMaxRows = 0;
     foreach ($groupSummaries as $colName => $summaryList) {
         $groupMaxRows = max($groupMaxRows, count($summaryList));

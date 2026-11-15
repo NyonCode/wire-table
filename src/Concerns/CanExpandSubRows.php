@@ -43,6 +43,12 @@ trait CanExpandSubRows
      */
     public function toggleRowExpansion(mixed $recordKey): void
     {
+        // A table without a toggle (subRowsExpandable(false)) is always open;
+        // there is nothing a request could move.
+        if (! $this->getTable()->isSubRowsExpandable()) {
+            return;
+        }
+
         $key = (string) $recordKey;
         $expanded = $this->tableState->get('rows.expanded', []);
 
@@ -61,6 +67,10 @@ trait CanExpandSubRows
      */
     public function expandsSubRowsByDefault(): bool
     {
+        if (! $this->getTable()->isSubRowsExpandable()) {
+            return true;
+        }
+
         $override = $this->tableState->get('rows.expandAll');
 
         return $override === null
@@ -80,7 +90,9 @@ trait CanExpandSubRows
      */
     public function setSubRowsExpandAll(bool $expand): void
     {
-        if (! $this->getTable()->hasSubRows()) {
+        $table = $this->getTable();
+
+        if (! $table->hasSubRows() || ! $table->isSubRowsExpandable()) {
             return;
         }
 
@@ -139,11 +151,57 @@ trait CanExpandSubRows
      */
     public function isRowExpanded(mixed $recordKey): bool
     {
+        // subRowsExpandable(false) means "always open, no toggle". Without this
+        // the rows had neither: no chevron to open them, and a baseline of
+        // "collapsed" that kept every panel shut.
+        $table = $this->getTable();
+
+        if ($table->hasSubRows() && ! $table->isSubRowsExpandable()) {
+            return true;
+        }
+
         $expanded = $this->tableState->get('rows.expanded', []);
         $isException = in_array((string) $recordKey, $expanded, true);
 
         // Against a default-expanded baseline the list tracks *collapsed* rows.
         return $this->expandsSubRowsByDefault() ? ! $isException : $isException;
+    }
+
+    /**
+     * Whether answering a write with row partials for these keys leaves the
+     * expander column where the last full render put it.
+     *
+     * The column is a property of the page ({@see Table::showsExpanderColumnFor()}),
+     * but a row partial redraws one row and leaves the header, the filter row
+     * and the footer alone. That is only safe while the answer cannot move:
+     * the table decides sub-rows the same way for every record, or some row
+     * this write did NOT touch still has them — then the column was there
+     * before and is there after. Otherwise the changed rows may be the ones
+     * deciding it (a subRowsVisible() closure over the edited attribute), and
+     * the caller renders the region instead, the way it does for an edit to the
+     * column the table groups by.
+     *
+     * @param  iterable<mixed>  $records  The page.
+     * @param  array<int, int|string>  $changedKeys
+     */
+    protected function rowPartialsKeepExpanderColumn(iterable $records, array $changedKeys): bool
+    {
+        $table = $this->getTable();
+
+        if (! $table->hasSubRows() || ! $table->decidesSubRowsPerRecord()) {
+            return true;
+        }
+
+        $changed = array_flip(array_map('strval', $changedKeys));
+        $key = $table->getPrimaryKey();
+
+        foreach ($records as $record) {
+            if (! isset($changed[(string) $record->{$key}]) && $table->hasSubRowsFor($record)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
