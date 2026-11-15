@@ -73,11 +73,6 @@ final class ShellRenderPlan
         /** @var array<int, string> */
         public readonly array $sharedViews = [],
         public readonly bool $canShareViews = false,
-        /**
-         * Whether this page draws the expander column. Narrower than
-         * $hasSubRows: a page where no record gets sub-rows drops it.
-         */
-        public readonly bool $hasExpanderColumn = false,
     ) {}
 
     /**
@@ -85,7 +80,7 @@ final class ShellRenderPlan
      *                                            consumer's component needs no `implements`; the contract is what it must
      *                                            be able to answer, and what a test double implements.
      */
-    public static function resolve(Table $table, mixed $component, bool $hasColumnToggles, ?bool $hasExpanderColumn = null): self
+    public static function resolve(Table $table, mixed $component, bool $hasColumnToggles): self
     {
         $filters = $table->getFilters();
         $hasSubRows = $table->hasSubRows();
@@ -111,7 +106,6 @@ final class ShellRenderPlan
             savedViews: $hasSavedViews ? $component->getTableViews() : [],
             sharedViews: $hasSavedViews ? $component->getSharedTableViews() : [],
             canShareViews: $hasSavedViews && $component->canShareTableViews(),
-            hasExpanderColumn: $hasExpanderColumn ?? $hasSubRows,
             hasViewMenu: $hasColumnToggles || $isSubRowsExpandable || $hasSavedViews || $table->hasPinnableColumns(),
             viewMenuLabel: $hasColumnToggles && ! $isSubRowsExpandable && ! $hasSavedViews
                 ? __('wire-table::messages.toggle_columns')

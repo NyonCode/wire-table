@@ -54,10 +54,6 @@
     // Sub-rows and grouping — the regions inside the body that are their own
     // shape of row.
     $hasSubRows = $plan->shell()->hasSubRows;
-    // Whether THIS page draws the expander column: a page where no record gets
-    // sub-rows drops it, header and filter cell included, so it must agree with
-    // what RowRenderer draws on every row.
-    $hasExpanderColumn = $plan->shell()->hasExpanderColumn;
     $isSubRowsExpandable = $plan->shell()->isSubRowsExpandable;
     $allRowsExpanded = $plan->shell()->allRowsExpanded;
     $hasGrouping = $plan->shell()->hasGrouping;
@@ -312,7 +308,7 @@
 
                                     {{-- Sub-row Toggle Header: master expand/collapse, directly
                                          above the row chevrons it drives. --}}
-                                    @if($hasExpanderColumn)
+                                    @if($hasSubRows)
                                         <th scope="col" class="w-10 {{ $headerPadding }}">
                                             @if($isSubRowsExpandable)
                                                 @include('wire-table::tables.partials.sub-rows-master-toggle', [
@@ -407,7 +403,7 @@
                                         @endif
 
                                         {{-- Sub-row Toggle Filter Cell --}}
-                                        @if($hasExpanderColumn)
+                                        @if($hasSubRows)
                                             <th class="{{ $headerPadding }}"></th>
                                         @endif
 

@@ -62,7 +62,6 @@ final class SummaryRenderer
             'isBordered' => $layout->isBordered,
             'visibleColumns' => $columns->visible,
             'colSpan' => $columns->colSpan,
-            'hasExpanderColumn' => $this->plan->shell()->hasExpanderColumn,
             'stickyCellClass' => $actions->stickyCellClass,
             'stickyLayers' => $actions->stickyLayers,
         ])->render();
@@ -150,7 +149,6 @@ final class SummaryRenderer
             'groupSummaries' => $summaries,
             'visibleColumns' => $columns->visible,
             'colSpan' => $columns->colSpan,
-            'hasExpanderColumn' => $this->plan->shell()->hasExpanderColumn,
             'cellPadding' => $layout->cellPadding,
             'isBordered' => $layout->isBordered,
             'isSelectable' => $this->plan->row()->isSelectable,
